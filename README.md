@@ -137,7 +137,9 @@ Four properties of the data worth knowing before reading the JSON:
 
   `peakSumMemoryBytes` is the maximum, over the window, of memory summed across those
   pods at each step; `cpuSecondsTotal` is per pod `max − min` of the cumulative counter
-  (no `rate()`, so short-lived pods are not smoothed away), summed. Any datamover alive
+  (no `rate()`, so short-lived pods are not smoothed away), summed — **CPU-seconds**, the
+  total CPU time the datamovers consumed; `avgCpuCores` divides it by the window length
+  (716 cpu-s over 14.5 min ≈ 0.82 cores on average), which is what the HTML shows first. Any datamover alive
   in the window is counted — two policies exporting in the same minute see the same
   pods, and the disks of one VM export concurrently, so their PVC rows show the same
   figures. Pods that lived less than one scrape interval are listed in

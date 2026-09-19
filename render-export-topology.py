@@ -227,10 +227,17 @@ def dm_cell(dm):
     cpu = dm.get("cpuSecondsTotal")
     pods = ", ".join(f'{p["pod"]}→{p.get("appNamespace") or "?"}' for p in dm.get("pods") or [])
     nos = dm.get("podsWithoutSamples") or []
-    tip = f"{len(dm.get('pods') or [])} pods with samples: {pods}"
+    avg = dm.get("avgCpuCores")
+    win = (dm.get("windowEnd") or 0) - (dm.get("windowStart") or 0)
+    tip = (f"memory: peak of the sum over all datamover pods alive in the window. "
+           f"CPU: {cpu if cpu is not None else '–'} CPU-seconds consumed by those pods in total"
+           + (f" over {fmt_dur(win)}, i.e. {avg:.2f} cores on average" if avg is not None and win else "")
+           + f". {len(dm.get('pods') or [])} pods with samples: {pods}")
     if nos:
         tip += f" · {len(nos)} without samples: {', '.join(nos)}"
-    return (f'<span title="{esc(tip)}">{esc(mem)} peak · {cpu if cpu is not None else "–"} cpu-s'
+    cpu_txt = (f'{avg:.2f} cores avg <span class="muted">({cpu:.0f} cpu-s)</span>' if avg is not None and cpu is not None
+               else f'{cpu if cpu is not None else "–"} cpu-s')
+    return (f'<span title="{esc(tip)}">{esc(mem)} peak · {cpu_txt}'
             f' · {dm.get("samples", 0)} samples</span>')
 
 
