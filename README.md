@@ -73,6 +73,23 @@ per-PVC tree listing; `--prom-url` / `--prom-token` for a non-OpenShift Promethe
 `--no-metrics` to skip cAdvisor entirely. `./generate-export-topology.sh` is a thin
 wrapper. `--help` lists everything.
 
+**Air-gapped clusters.** `repo_checker` detects nothing about the environment: by default
+it downloads from `docs.kasten.io`, pulls `gcr.io/kasten-images/k10tools`, and picks the
+image *tag* from the newest `kasten/k10` chart in your local helm repository — not from
+the cluster. The generator always pins the tag to the cluster's K10 version
+(`--image-tag` to override). For an air gap, mirror `k10tools`, `datamover` and
+`kanister-tools` at that version into the registry K10 already pulls from, download
+`https://docs.kasten.io/downloads/<version>/tools/k10_repo_checker.sh` once, and run:
+
+```sh
+./generate-export-topology.py --repo-checker ./k10_repo_checker.sh --image-registry auto -o export-topology.json
+```
+
+`auto` reads the registry from K10's own image references (`KanisterToolsImage` in
+`k10-config`), e.g. `registry.connect.redhat.com/kasten`; give an explicit prefix
+instead if your mirror lives elsewhere. The generator logs the image it will use
+(`repo_checker images: …`) before the first repo_checker call.
+
 A full run takes minutes to an hour (the `repo_checker` inventory re-scans the whole
 catalog, and every filesystem PVC gets a full tree listing). Progress goes to stderr
 with an elapsed-time prefix: one line per namespace/profile pair (`[3/18]`), one per

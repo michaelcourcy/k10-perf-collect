@@ -573,11 +573,26 @@ class ConnectError(RuntimeError):
     """repo_checker -o connect reported a failure (cause chain in the message)."""
 
 
+def k10_image_registry(k10cfg):
+    """Registry/prefix K10 itself pulls from, e.g. 'registry.connect.redhat.com/kasten' from
+    KanisterToolsImage=registry.connect.redhat.com/kasten/kanister-tools@sha256:... - the
+    natural value for repo_checker -i on an air-gapped cluster."""
+    img = (k10cfg or {}).get("KanisterToolsImage") or ""
+    if "/" not in img:
+        return None
+    return img.rsplit("/", 1)[0]
+
+
 class RepoChecker:
-    def __init__(self, kube, path, version, workdir, keep_pods=False):
+    def __init__(self, kube, path, version, workdir, keep_pods=False, image_registry=None, image_tag=None):
         self.kube = kube
         self.workdir = workdir
         self.keep_pods = keep_pods
+        # repo_checker defaults to gcr.io/kasten-images and to the newest kasten/k10 chart in
+        # the LOCAL helm repo - on a 9.0.1 cluster it happily runs k10tools:9.0.5. Pin the tag
+        # to the cluster's version; the registry stays gcr.io unless asked (air gap).
+        self.image_registry = image_registry
+        self.image_tag = image_tag or version
         self.created_pods = []
         self.deleting_pods = []
         self.path = path or self._download(version)
@@ -610,7 +625,12 @@ class RepoChecker:
         # repo_checker writes its pod manifest (repo-checker.yaml) to the current directory and
         # deletes it afterwards; run it in this run's private workdir so two generators on one
         # machine (or a stray file in the caller's directory) cannot interfere
-        proc = subprocess.Popen([os.path.abspath(self.path), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        extra = []
+        if self.image_tag:
+            extra += ["-t", self.image_tag]
+        if self.image_registry:
+            extra += ["-i", self.image_registry]
+        proc = subprocess.Popen([os.path.abspath(self.path), *args, *extra], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, env=env, cwd=self.workdir)
         lines, last = [], {"line": "", "seen": time.monotonic(), "printed": time.monotonic()}
 
@@ -1124,7 +1144,12 @@ def collect(args):
 
     # ---- inventory: what actually exists in the repositories -------------------------------
     workdir = tempfile.mkdtemp(prefix="export-topology-")
-    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods)
+    detected = k10_image_registry(k10cfg)
+    registry = detected if args.image_registry == "auto" else args.image_registry
+    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
+    log(f"repo_checker images: {registry or 'gcr.io/kasten-images'}/k10tools:{args.image_tag or ver}"
+        + (f"  (K10 itself pulls from {detected}; pass --image-registry auto if gcr.io is unreachable)"
+           if detected and not registry and detected != "gcr.io/kasten-images" else ""))
 
     # ---- scope: which (namespace, profile) pairs to read, from two independent sources ----
     # 1. the export policies (the scope rule; never depends on repo_checker)
@@ -1668,7 +1693,11 @@ def main():
     ap.add_argument("-o", "--output", default="export-topology.json")
     ap.add_argument("--namespace", action="append", help="restrict to these application namespaces (repeatable)")
     ap.add_argument("--policy", action="append", help="restrict to these policies (repeatable); with --namespace, one pair")
-    ap.add_argument("--repo-checker", help="path to k10_repo_checker.sh (default: download for the cluster's K10 version)")
+    ap.add_argument("--repo-checker", help="path to k10_repo_checker.sh (default: download for the cluster's K10 version; "
+                                           "required on an air-gapped cluster)")
+    ap.add_argument("--image-registry", help="registry/prefix for the k10tools, datamover and kanister-tools images repo_checker "
+                                             "runs (default gcr.io/kasten-images; 'auto' = the one K10 itself pulls from)")
+    ap.add_argument("--image-tag", help="image tag for those images (default: the cluster's K10 version)")
     ap.add_argument("--keep-pods", action="store_true", help="leave debug-kopia pods behind")
     ap.add_argument("--no-metrics", action="store_true", help="skip cAdvisor / kube-state-metrics")
     ap.add_argument("--prom-url", help="non-OpenShift Prometheus base URL")
