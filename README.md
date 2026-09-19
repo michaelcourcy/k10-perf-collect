@@ -73,27 +73,33 @@ per-PVC tree listing; `--prom-url` / `--prom-token` for a non-OpenShift Promethe
 `--no-metrics` to skip cAdvisor entirely. `./generate-export-topology.sh` is a thin
 wrapper. `--help` lists everything.
 
-**Air-gapped clusters.** `repo_checker` detects nothing about the environment: by default
-it downloads from `docs.kasten.io`, pulls `gcr.io/kasten-images/k10tools`, and picks the
-image *tag* from the newest `kasten/k10` chart in your local helm repository — not from
-the cluster. The generator always pins the tag to the cluster's K10 version
-(`--image-tag` to override). For an air gap, mirror `k10tools`, `datamover` and
-`kanister-tools` at that version into the registry K10 already pulls from, download
+**Which registry repo_checker pulls from.** repo_checker detects nothing about the
+environment: on its own it downloads from `docs.kasten.io`, pulls
+`gcr.io/kasten-images/k10tools` and picks the image *tag* from the newest `kasten/k10`
+chart in your local helm repository — not from the cluster. The generator pins the tag
+to the cluster's K10 version (`--image-tag` to override) and, by default, uses **the
+registry K10 itself pulls from** (read from `KanisterToolsImage` in `k10-config`, e.g.
+`registry.connect.redhat.com/kasten` on an operator install — verified to serve
+`k10tools:<version>`): on an enterprise cluster that registry is whitelisted or mirrored
+where `gcr.io` is not. `gcr.io/kasten-images` is used only when K10's registry cannot be
+read, or when you pass `--image-registry gcr.io/kasten-images`. The log states the
+choice before the first repo_checker call: `repo_checker images: <registry>/k10tools:<tag>
+(the registry K10 pulls from)`.
+
+For a fully air-gapped cluster, mirror `k10tools`, `datamover` and `kanister-tools` at
+the cluster's version next to the K10 images (or anywhere reachable, then
+`--image-registry <prefix>`), download
 `https://docs.kasten.io/downloads/<version>/tools/k10_repo_checker.sh` once, and run:
 
 ```sh
-./generate-export-topology.py --repo-checker ./k10_repo_checker.sh --image-registry auto -o export-topology.json
+./generate-export-topology.py --repo-checker ./k10_repo_checker.sh -o export-topology.json
 ```
 
-`auto` reads the registry from K10's own image references (`KanisterToolsImage` in
-`k10-config`), e.g. `registry.connect.redhat.com/kasten` for an operator install —
-verified to serve `k10tools:<version>` as a tag; give an explicit prefix instead if your
-mirror lives elsewhere. The generator logs the image it will use (`repo_checker images:
-…`) before the first repo_checker call. If a `k10tools-*` or `debug-kopia-*` pod cannot
-pull its image (`ErrImagePull`, `ImagePullBackOff`, `InvalidImageName`), the run stops
-within about 10 s with `AUDIT ABORTED`, the image, the kubelet's reason and the fix
-(mirror the three images, `--image-registry`, `--repo-checker`), and deletes the stuck
-pod — repo_checker on its own would wait forever.
+If a `k10tools-*` or `debug-kopia-*` pod cannot pull its image (`ErrImagePull`,
+`ImagePullBackOff`, `InvalidImageName`), the run stops within about 10 s with
+`AUDIT ABORTED`, the image, the kubelet's reason and the fix — typically "k10tools is not
+mirrored in K10's registry: mirror it, or pass `--image-registry gcr.io/kasten-images`
+if reachable" — and deletes the stuck pod; repo_checker on its own would wait forever.
 
 A full run takes minutes to an hour (the `repo_checker` inventory re-scans the whole
 catalog, and every filesystem PVC gets a full tree listing). Progress goes to stderr

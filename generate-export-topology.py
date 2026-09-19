@@ -638,8 +638,13 @@ class RepoChecker:
         self.kube.run("-n", self.kube.k10ns, "delete", "pod", pod, "--grace-period=1", "--wait=true", "--timeout=60s", check=False)
         which = "k10tools" if pod.startswith("k10tools-") else "datamover (debug-kopia)"
         detected = getattr(self, "detected_registry", None)
-        hint = (f" K10 itself pulls from {detected}: try --image-registry auto." if detected and detected != (self.image_registry or "gcr.io/kasten-images")
-                else "")
+        if detected and self.image_registry == detected:
+            hint = (f" This is the registry K10 itself pulls from, so k10tools:{self.image_tag} is probably not mirrored there: "
+                    f"mirror it (and datamover, kanister-tools), or pass --image-registry gcr.io/kasten-images if this cluster can reach gcr.io.")
+        elif detected:
+            hint = f" K10 itself pulls from {detected}: try --image-registry {detected}."
+        else:
+            hint = ""
         raise ImagePullError(
             f"\nAUDIT ABORTED: the {which} pod {pod} in {self.kube.k10ns} cannot pull its image\n"
             f"  image : {image}\n  reason: {reason}" + (f" - {message[:300]}" if message else "") + "\n"
@@ -1191,13 +1196,18 @@ def collect(args):
 
     # ---- inventory: what actually exists in the repositories -------------------------------
     workdir = tempfile.mkdtemp(prefix="export-topology-")
+    # Default to the registry K10 itself pulls from: on an enterprise cluster that one is
+    # whitelisted or mirrored, gcr.io usually is not. gcr.io/kasten-images only when K10's
+    # registry cannot be read or when asked for explicitly.
     detected = k10_image_registry(k10cfg)
-    registry = detected if args.image_registry == "auto" else args.image_registry
+    if args.image_registry in (None, "auto"):
+        registry = detected or "gcr.io/kasten-images"
+        origin = "the registry K10 pulls from" if detected else "repo_checker default, K10's registry not readable from k10-config"
+    else:
+        registry, origin = args.image_registry, "--image-registry"
     rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
     rc.detected_registry = detected
-    log(f"repo_checker images: {registry or 'gcr.io/kasten-images'}/k10tools:{args.image_tag or ver}"
-        + (f"  (K10 itself pulls from {detected}; pass --image-registry auto if gcr.io is unreachable)"
-           if detected and not registry and detected != "gcr.io/kasten-images" else ""))
+    log(f"repo_checker images: {registry}/k10tools:{args.image_tag or ver}  ({origin})")
 
     # ---- scope: which (namespace, profile) pairs to read, from two independent sources ----
     # 1. the export policies (the scope rule; never depends on repo_checker)
@@ -1746,7 +1756,8 @@ def main():
     ap.add_argument("--repo-checker", help="path to k10_repo_checker.sh (default: download for the cluster's K10 version; "
                                            "required on an air-gapped cluster)")
     ap.add_argument("--image-registry", help="registry/prefix for the k10tools, datamover and kanister-tools images repo_checker "
-                                             "runs (default gcr.io/kasten-images; 'auto' = the one K10 itself pulls from)")
+                                             "runs (default: the one K10 itself pulls from, read from k10-config; "
+                                             "gcr.io/kasten-images if that cannot be read)")
     ap.add_argument("--image-tag", help="image tag for those images (default: the cluster's K10 version)")
     ap.add_argument("--keep-pods", action="store_true", help="leave debug-kopia pods behind")
     ap.add_argument("--no-metrics", action="store_true", help="skip cAdvisor / kube-state-metrics")
