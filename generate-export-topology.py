@@ -410,14 +410,17 @@ def ksm_pod_labels_exposed(prom, k10ns):
     return any(k.startswith("label_") for r in res for k in (r.get("metric") or {}))
 
 
-def datamover_metrics(prom, k10ns, pod_regex, start, end):
-    """Peak of the SUM of datamover memory, peak sum CPU rate and CPU-seconds consumed
-    across every datamover pod alive in [start, end], plus per-pod figures attributed
-    to a namespace through kube_pod_labels (guide 09).
+def datamover_metrics(prom, k10ns, pod_regex, start, end, namespace=None):
+    """Datamover memory peak (of the sum) and CPU-seconds in [start, end], per-pod figures
+    attributed to a namespace through kube_pod_labels (guide 09).
 
-    Not per PVC: copy-vol-data pods mount an ephemeral clone, not the source. The join
-    on kube_pod_labels gives namespace and job, which is what OpenShift's KSM exposes
-    thanks to --metric-labels-allowlist=pods=[*]."""
+    With `namespace`, the headline figures cover only the pods working for that namespace
+    (plus pods that could not be attributed, flagged); pods of other namespaces alive in
+    the same window are listed as concurrent load with their own peak, because a policy
+    exporting three namespaces at once otherwise shows the same six pods under each.
+    Not per PVC: copy-vol-data pods mount an ephemeral clone, not the source. The join on
+    kube_pod_labels gives namespace and job, which is what OpenShift's KSM exposes thanks
+    to --metric-labels-allowlist=pods=[*]."""
     if not (prom and prom.available):
         return None
     s = start - METRICS_PAD_SECONDS
@@ -443,17 +446,15 @@ def datamover_metrics(prom, k10ns, pod_regex, start, end):
         if m.get("label_k10_kasten_io_job_id") and m.get("label_app_name"):
             job_ns.setdefault(m["label_k10_kasten_io_job_id"], m["label_app_name"])
 
-    # memory: per-pod peak and the peak of the sum across pods at each timestamp
-    sum_at = {}
-    pods = {}
+    # memory: per-pod series (to sum over any subset of pods) and per-pod peak
+    series, pods = {}, {}
     for r in mem:
         pod = r["metric"]["pod"]
         vals = [(float(t), float(v)) for t, v in r["values"]]
         if not vals:
             continue
         pods.setdefault(pod, {})["peakMemoryBytes"] = int(max(v for _, v in vals))
-        for t, v in vals:
-            sum_at[t] = sum_at.get(t, 0.0) + v
+        series[pod] = vals
     for r in cpu:
         pod = r["metric"]["pod"]
         vals = [float(v) for _, v in r["values"]]
@@ -462,30 +463,60 @@ def datamover_metrics(prom, k10ns, pod_regex, start, end):
         elif vals:
             pods.setdefault(pod, {})["cpuSeconds"] = 0.0
 
-    out["samples"] = len(sum_at)
-    out["peakSumMemoryBytes"] = int(max(sum_at.values())) if sum_at else None
-    # CPU: total seconds across pods, and the average rate over the window
-    total_cpu = sum(p.get("cpuSeconds", 0.0) for p in pods.values())
+    def attribution(pod):
+        lab = pod_labels.get(pod, {})
+        return lab.get("label_app_name") or job_ns.get(lab.get("label_k10_kasten_io_job_id"))
+
+    def peak_of_sum(pod_names):
+        sum_at = {}
+        for pod in pod_names:
+            for t, v in series.get(pod, []):
+                sum_at[t] = sum_at.get(t, 0.0) + v
+        return (int(max(sum_at.values())) if sum_at else None), len(sum_at)
+
+    live = [pod for pod, p in pods.items() if p.get("peakMemoryBytes") or p.get("cpuSeconds")]
+    if namespace:
+        own = [pod for pod in live if attribution(pod) in (namespace, None)]
+        others = [pod for pod in live if attribution(pod) not in (namespace, None)]
+    else:
+        own, others = live, []
+
+    peak, nsamples = peak_of_sum(own)
+    out["samples"] = nsamples
+    out["peakSumMemoryBytes"] = peak
+    # CPU: total seconds across the namespace's pods, and the average rate over the window
+    total_cpu = sum(pods[pod].get("cpuSeconds", 0.0) for pod in own)
     out["cpuSecondsTotal"] = round(total_cpu, 3)
     out["avgCpuCores"] = round(total_cpu / max(e - s, 1), 4)
+    out["scope"] = (f"datamover pods attributed to namespace {namespace} (plus unattributed ones)" if namespace
+                    else "every datamover pod alive in the window")
+    if namespace and any(attribution(pod) is None for pod in own):
+        out["unattributedIncluded"] = sorted(pod for pod in own if attribution(pod) is None)
+    if others:
+        # what else was running: contention, and the cluster-wide load in this window
+        all_peak, _ = peak_of_sum(live)
+        out["concurrent"] = {"pods": [{"pod": pod, "appNamespace": attribution(pod)} for pod in sorted(others)],
+                             "namespaces": sorted({attribution(pod) for pod in others}),
+                             "allDatamoversPeakSumMemoryBytes": all_peak,
+                             "allDatamoversCpuSecondsTotal": round(sum(pods[pod].get("cpuSeconds", 0.0) for pod in live), 3)}
     out["podsWithoutSamples"] = []
     for pod, p in sorted(pods.items()):
         lab = pod_labels.get(pod, {})
-        job = lab.get("label_k10_kasten_io_job_id")
         # a pod that only ever shows a 0 working set lived less than one kubelet scrape
         # interval; listing it as a "peak of 0" would be misleading (guide 09)
-        if not p.get("peakMemoryBytes") and not p.get("cpuSeconds"):
+        if pod not in live:
             out["podsWithoutSamples"].append(pod)
             continue
         out["pods"].append({
             "pod": pod,
-            "appNamespace": lab.get("label_app_name") or job_ns.get(job),
+            "appNamespace": attribution(pod),
             "policy": lab.get("label_policy_name"),
-            "jobId": job,
+            "jobId": lab.get("label_k10_kasten_io_job_id"),
+            "own": pod in own,
             "peakMemoryBytes": p.get("peakMemoryBytes"),
             "cpuSeconds": p.get("cpuSeconds"),
         })
-    if not sum_at:
+    if not live:
         out["note"] = ("no cAdvisor samples in this window: the datamover pod lived less than one "
                        "scrape interval, or the window predates the metrics retention")
     return out
@@ -1440,7 +1471,7 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
                     if prom and prom.retention_seconds and (time.time() - epoch(st)) > prom.retention_seconds:
                         se["datamover"] = {"note": "snapshot predates the metrics retention window"}
                     else:
-                        se["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(st), epoch(en))
+                        se["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(st), epoch(en), namespace=ns)
                 snap_entries.append(se)
                 prev = s
 
@@ -1640,7 +1671,7 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
             s_, e_ = parse_rfc3339(e.get("startTime")), parse_rfc3339(e.get("endTime"))
             if s_ and e_ and e["namespace"] in in_scope_ns and prom and prom.available and \
                     not (prom.retention_seconds and time.time() - epoch(s_) > prom.retention_seconds):
-                e["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(s_), epoch(e_))
+                e["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(s_), epoch(e_), namespace=e["namespace"])
 
     # ---- assemble by policy -------------------------------------------------------------------
     def profile_summary(name):

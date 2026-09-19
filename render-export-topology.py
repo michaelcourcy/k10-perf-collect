@@ -236,7 +236,9 @@ def dm_cell(dm):
         return f'<span class="muted" title="{esc(dm.get("note"))}">no samples</span>'
     mem = fmt_bytes(dm.get("peakSumMemoryBytes"))
     cpu = dm.get("cpuSecondsTotal")
-    pods = ", ".join(f'{p["pod"]}→{p.get("appNamespace") or "?"}' for p in dm.get("pods") or [])
+    own_pods = [p for p in dm.get("pods") or [] if p.get("own", True)]
+    pods = ", ".join(f'{p["pod"]}→{p.get("appNamespace") or "?"}' for p in own_pods)
+    conc = dm.get("concurrent") or {}
     nos = dm.get("podsWithoutSamples") or []
     avg = dm.get("avgCpuCores")
     ws, we = ts_seconds(dm.get("windowStart")), ts_seconds(dm.get("windowEnd"))
@@ -244,13 +246,21 @@ def dm_cell(dm):
     tip = (f"memory: peak of the sum over all datamover pods alive in the window. "
            f"CPU: {cpu if cpu is not None else '–'} CPU-seconds consumed by those pods in total"
            + (f" over {fmt_dur(win)}, i.e. {avg:.2f} cores on average" if avg is not None and win else "")
-           + f". {len(dm.get('pods') or [])} pods with samples: {pods}")
+           + f". {len(own_pods)} pods of this namespace with samples: {pods}")
+    if conc:
+        tip += (f". Concurrently in the same window: {len(conc.get('pods') or [])} datamover pods of "
+                f"{', '.join(conc.get('namespaces') or [])} — all datamovers together peaked at "
+                f"{fmt_bytes(conc.get('allDatamoversPeakSumMemoryBytes'))} and used {conc.get('allDatamoversCpuSecondsTotal', 0):.0f} cpu-s")
+    if dm.get("unattributedIncluded"):
+        tip += f". Included without attribution: {', '.join(dm['unattributedIncluded'])}"
     if nos:
         tip += f" · {len(nos)} without samples: {', '.join(nos)}"
     cpu_txt = (f'{avg:.2f} cores avg <span class="muted">({cpu:.0f} cpu-s)</span>' if avg is not None and cpu is not None
                else f'{cpu if cpu is not None else "–"} cpu-s')
+    conc_txt = (f' <span class="muted">· +{len(conc.get("pods") or [])} concurrent ({", ".join(conc.get("namespaces") or [])})</span>'
+                if conc else "")
     return (f'<span title="{esc(tip)}">{esc(mem)} peak · {cpu_txt}'
-            f' · {dm.get("samples", 0)} samples</span>')
+            f' · {dm.get("samples", 0)} samples{conc_txt}</span>')
 
 
 def snapshots_table(snaps):

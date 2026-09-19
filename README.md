@@ -171,11 +171,17 @@ Five properties of the data worth knowing before reading the JSON:
   kube_pod_labels{namespace="kasten-io",pod=~"<regex>"}
   ```
 
-  `peakSumMemoryBytes` is the maximum, over the window, of memory summed across those
-  pods at each step.
+  `peakSumMemoryBytes` is the maximum, over the window, of memory summed across the
+  pods at each step. Both figures cover **the datamover pods attributed to the export's
+  namespace** (plus any pod that could not be attributed, listed in
+  `unattributedIncluded`); pods of other namespaces alive in the same window — a policy
+  exporting three namespaces at once, or two policies overlapping — are reported
+  separately under `concurrent` (their namespaces, and the peak/CPU of *all* datamovers
+  together, i.e. the load the cluster actually saw). The HTML appends "+N concurrent
+  (ns…)" to the cell and details it in the tooltip.
 
-  **CPU is reported in CPU-seconds (`cpu-s`)**: the total CPU time all datamover pods in
-  the window consumed — a pod burning 2 cores for 30 s is 60 cpu-s. It comes from the
+  **CPU is reported in CPU-seconds (`cpu-s`)**: the total CPU time the namespace's
+  datamover pods consumed in the window — a pod burning 2 cores for 30 s is 60 cpu-s. It comes from the
   cumulative counter `container_cpu_usage_seconds_total`, per pod `max − min` between the
   first and last sample inside the window, summed over pods (`cpuSecondsTotal`). This is
   the one CPU figure the data supports: a `rate()` would need several samples per pod,
