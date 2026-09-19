@@ -1,0 +1,20 @@
+# Audit output: per-cluster, contains extracts, never committed.
+k10-audit-*/
+
+# Anything a guide writes if it is run from the repo root instead of $AUDIT_DIR.
+*.tsv
+*.json
+!package.json
+*.tar.gz
+kopia-diagnose-*
+dm-specs/
+metrics-window.txt
+00-prerequisites.txt
+00-audit-env.sh
+
+# Tools the guides download at run time.
+k10_repo_checker.sh
+
+# python bytecode from the generator
+__pycache__/
+*.pyc

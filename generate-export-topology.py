@@ -1,0 +1,1704 @@
+#!/usr/bin/env python3
+"""Generate the K10 export topology of a cluster as JSON.
+
+Everything hangs off what is actually in the Kopia repositories on the object stores:
+a namespace that has never been exported does not appear. repo_checker is the primary
+source; the K10 API objects, K10's own Prometheus and cluster monitoring (cAdvisor +
+kube-state-metrics) complete the picture.
+
+    ExportTopology
+      helmLimiters
+      policies[]
+        profile, frequency / subFrequency, exportFrequency, retention
+        namespaces[]
+          actionPodSpecs[]
+          repository (id, maintenance)
+          exports[]  (ExportAction windows, datamover peak cpu/memory)
+          pvcs[]
+            fileCount, totalSizeBytes, averageFileSizeBytes, sizeHistogram
+            lastChangeRate, lastMaintenance
+            snapshots[] (files, size, start/end, change rate, datamover peak cpu/memory)
+
+Requirements: python3 (stdlib only), kubectl in PATH, helm in PATH (repo_checker
+insists on it), network access to the cluster. Run:
+
+    ./generate-export-topology.py --context <kube-context> -o export-topology.json
+
+Everything the script learnt the hard way is in guides/ and CLAUDE.md of this repo; the
+comments below point at the relevant guide where it matters.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import threading
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# --------------------------------------------------------------------------- constants
+
+REPO_CHECKER_URL = "https://docs.kasten.io/downloads/{version}/tools/k10_repo_checker.sh"
+
+# Worker pods K10 creates for an export. Validated on 9.0.5 (guide 09).
+DATAMOVER_POD_REGEX = r"data-mover.*|copy-vol-data.*|create-repo.*|repository-server.*|restore-data.*"
+
+# k10-config keys that govern datamover behaviour (guide 10 step 3).
+LIMITER_KEY_REGEX = re.compile(
+    r"^(K10Limiter|k10DataStore|WorkerPod|K10EphemeralPVCOverhead|K10BackupBufferFileHeadroomFactor"
+    r"|K10Timeout|csiSnapshot|workerPodResourcesCRDEnabled)"
+)
+
+# File-size buckets for the histogram (guide 05 step C).
+HISTOGRAM_BUCKETS = [
+    ("lt4KiB", 4 * 1024),
+    ("4KiB_64KiB", 64 * 1024),
+    ("64KiB_1MiB", 1024 * 1024),
+    ("1MiB_16MiB", 16 * 1024 * 1024),
+    ("16MiB_256MiB", 256 * 1024 * 1024),
+    ("gt256MiB", None),
+]
+
+# Padding around a Kopia snapshot window when reading cAdvisor. The kubelet scrapes
+# every 30 s and the datamover pod starts before Kopia starts hashing.
+METRICS_PAD_SECONDS = 45
+
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+    print(f"  ! {msg}", file=sys.stderr)
+
+
+START_TIME = time.monotonic()
+VERBOSE = False
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def log(msg):
+    """Progress goes to stderr with the elapsed time, so a user watching a long run can tell
+    the tool is still working (inventory and tree listings take minutes with no other output)."""
+    e = int(time.monotonic() - START_TIME)
+    print(f"[{e // 60:02d}:{e % 60:02d}] {msg}", file=sys.stderr, flush=True)
+
+
+class Step:
+    """Context manager that logs how long a sub-step took: `with Step("content list") as st: ...;
+    st.note = f"{n} contents"` prints `    content list: 12345 contents (41s)`."""
+
+    HEARTBEAT = 60
+
+    def __init__(self, label, indent=4):
+        self.label, self.indent, self.note = label, indent, ""
+        self.done = threading.Event()
+
+    def _beat(self):
+        # a single kubectl exec (content list, tree listing) can run for many minutes with
+        # no output; say so, or a slow step is indistinguishable from a hung one
+        while not self.done.wait(self.HEARTBEAT):
+            log(f"{' ' * self.indent}{self.label} still running ({int(time.monotonic() - self.t0)}s) ...")
+
+    def __enter__(self):
+        self.t0 = time.monotonic()
+        log(f"{' ' * self.indent}{self.label} ...")
+        threading.Thread(target=self._beat, daemon=True).start()
+        return self
+
+    def __exit__(self, et, ev, tb):
+        self.done.set()
+        if et is None:
+            d = time.monotonic() - self.t0
+            log(f"{' ' * self.indent}{self.label}: {self.note} ({d:.0f}s)".replace(":  (", " ("))
+
+
+# --------------------------------------------------------------------------- helpers
+
+def parse_rfc3339(s):
+    """Kopia emits nanoseconds; datetime accepts at most microseconds."""
+    if not s:
+        return None
+    s = s.strip()
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$", s)
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    frac = (frac or ".0")[:7].ljust(7, "0")  # keep 6 digits
+    if tz == "Z":
+        tz = "+00:00"
+    return dt.datetime.fromisoformat(f"{base}{frac}{tz}")
+
+
+def epoch(d):
+    return d.timestamp() if d else None
+
+
+def iso(d):
+    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if d else None
+
+
+def safe_div(a, b):
+    return (a / b) if b else None
+
+
+# --------------------------------------------------------------------------- kubectl
+
+class Kube:
+    def __init__(self, context, k10ns):
+        self.context = context
+        self.k10ns = k10ns
+
+    def run(self, *args, check=True, stdin=None, timeout=600):
+        cmd = ["kubectl"]
+        if self.context:
+            cmd += ["--context", self.context]
+        cmd += list(args)
+        r = subprocess.run(cmd, capture_output=True, text=True, input=stdin, timeout=timeout)
+        if check and r.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd[:6])}...: {r.stderr.strip()[:300]}")
+        return r
+
+    def json(self, *args):
+        r = self.run(*args, "-o", "json", check=False)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return None
+
+    def get(self, kind, name=None, ns=None, all_ns=False):
+        args = ["get", kind]
+        if name:
+            args.append(name)
+        if all_ns:
+            args.append("-A")
+        elif ns:
+            args += ["-n", ns]
+        return self.json(*args)
+
+    def exec(self, ns, pod, script, timeout=1800):
+        """Run a shell command inside the pod; only stdout is returned. The command goes as
+        an argument (sh -c), not on stdin: with `kubectl exec -i` and piped stdin, large
+        outputs came back truncated or garbled (a 100 KB `kopia snapshot list --json`
+        broke mid-document on a lab cluster, intermittently)."""
+        r = self.run("-n", ns, "exec", pod, "--", "sh", "-c", script, check=False, timeout=timeout)
+        return r.stdout, r.stderr, r.returncode
+
+
+# --------------------------------------------------------------------------- prometheus
+
+class Prom:
+    """Cluster monitoring (cAdvisor + kube-state-metrics). OpenShift Thanos by default;
+    any Prometheus with --prom-url. Reproduces lib/prometheus.sh (guide 00 section 5)."""
+
+    def __init__(self, kube, url=None, token=None, prom_ns="openshift-monitoring", header=None):
+        self.kube = kube
+        self.url = url
+        self.token = token
+        self.prom_ns = prom_ns
+        self.header = header
+        self.flavour = "custom" if url else "openshift-thanos"
+        self.available = False
+        self.retention_seconds = None
+        self.ctx = ssl.create_default_context()
+        self.ctx.check_hostname = False
+        self.ctx.verify_mode = ssl.CERT_NONE
+
+    def init(self):
+        if not self.url:
+            r = self.kube.run("-n", self.prom_ns, "get", "route", "thanos-querier",
+                              "-o", "jsonpath={.spec.host}", check=False)
+            host = r.stdout.strip()
+            if not host:
+                warn(f"no thanos-querier route in {self.prom_ns}; pass --prom-url for a non-OpenShift Prometheus. "
+                     "Datamover metrics will be absent.")
+                return False
+            self.url = f"https://{host}"
+            self._mint_token()
+        self.available = self._probe()
+        self._retention()
+        return self.available
+
+    def _mint_token(self):
+        r = self.kube.run("-n", self.prom_ns, "create", "token", "prometheus-k8s",
+                          "--duration=6h", check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            self.token = r.stdout.strip()
+        else:
+            warn(f"could not mint a token for prometheus-k8s in {self.prom_ns}: {r.stderr.strip()[:120]}")
+
+    def _probe(self):
+        try:
+            v = self.query("count(container_cpu_usage_seconds_total{namespace=\"%s\"})" % self.kube.k10ns)
+            n = int(float(v[0]["value"][1])) if v else 0
+            if n == 0:
+                warn(f"cluster monitoring reachable but has no cAdvisor series for {self.kube.k10ns}")
+            return n > 0
+        except Exception as e:  # noqa: BLE001
+            warn(f"cluster monitoring not usable: {e}")
+            return False
+
+    def _retention(self):
+        """Guide 00 section 6: declared retention, capped by replica uptime when the TSDB is
+        an emptyDir. Used to mark snapshots that predate the metrics we still have."""
+        cr = self.kube.get("prometheus", "k8s", ns=self.prom_ns)
+        if not cr:
+            return
+        ret = (cr.get("spec") or {}).get("retention") or "15d"
+        m = re.match(r"^(\d+)([dhw])$", ret)
+        secs = {"d": 86400, "h": 3600, "w": 604800}
+        ret_s = int(m.group(1)) * secs[m.group(2)] if m else 15 * 86400
+        persistent = bool((cr.get("spec") or {}).get("storage"))
+        if not persistent:
+            pods = self.kube.get("pods", ns=self.prom_ns) or {"items": []}
+            up = 0
+            for p in pods["items"]:
+                if (p["metadata"].get("labels") or {}).get("app.kubernetes.io/name") != "prometheus":
+                    continue
+                st = parse_rfc3339(p["status"].get("startTime"))
+                if st:
+                    up = max(up, time.time() - st.timestamp())
+            ret_s = min(ret_s, up) if up else ret_s
+        self.retention_seconds = int(ret_s)
+
+    def _http(self, path, params, retry=True):
+        data = urllib.parse.urlencode(params).encode()
+        req = urllib.request.Request(f"{self.url}{path}", data=data, method="POST")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        if self.header:
+            k, _, v = self.header.partition(":")
+            req.add_header(k.strip(), v.strip())
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and retry and self.flavour == "openshift-thanos":
+                self._mint_token()
+                return self._http(path, params, retry=False)
+            raise RuntimeError(f"HTTP {e.code} from {self.url}{path}")
+        out = json.loads(body)
+        if out.get("status") != "success":
+            raise RuntimeError(out.get("error", "prometheus error"))
+        return out["data"]["result"]
+
+    def query(self, q):
+        return self._http("/api/v1/query", {"query": q})
+
+    def query_range(self, q, start, end, step="15s"):
+        return self._http("/api/v1/query_range", {"query": q, "start": start, "end": end, "step": step})
+
+
+_QUANTITY = {"n": 1e-9, "u": 1e-6, "m": 1e-3, "": 1, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15,
+             "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4, "Pi": 1024 ** 5}
+
+
+def parse_quantity(q):
+    """Kubernetes quantity -> float in base units (cores, bytes). '7500m' -> 7.5, '32Gi' -> bytes,
+    '1091738596n' -> 1.09 cores, '446301077993' -> 446301077993."""
+    if q is None:
+        return None
+    m = re.fullmatch(r"\s*([0-9.]+)\s*([a-zA-Z]*)\s*", str(q))
+    if not m or m.group(2) not in _QUANTITY:
+        return None
+    return float(m.group(1)) * _QUANTITY[m.group(2)]
+
+
+def collect_nodes(kube):
+    """Capacity and allocatable from the Node objects; usage at this instant from the
+    kubelet stats summary (/api/v1/nodes/<n>/proxy/stats/summary: CPU, working-set memory
+    and the root filesystem that backs ephemeral storage, one call per node), falling back
+    to the metrics API (/apis/metrics.k8s.io/v1beta1/nodes, CPU and memory only) when
+    nodes/proxy is not permitted. A saturated node explains a slow datamover better than
+    any repository figure, so this sits in the report header."""
+    nodes = (kube.get("nodes") or {"items": []})["items"]
+    out = {"sampledAt": iso(dt.datetime.now(dt.timezone.utc)), "items": [], "usageSources": [], "notes": []}
+    metrics_api = None
+    for n in nodes:
+        md, st = n["metadata"], n.get("status") or {}
+        lab = md.get("labels") or {}
+        cap, alloc = st.get("capacity") or {}, st.get("allocatable") or {}
+        item = {
+            "name": md["name"],
+            "roles": sorted(k.split("/", 1)[1] for k in lab if k.startswith("node-role.kubernetes.io/")),
+            "instanceType": lab.get("node.kubernetes.io/instance-type"),
+            "kubeletVersion": (st.get("nodeInfo") or {}).get("kubeletVersion"),
+            "pressure": sorted(c["type"] for c in st.get("conditions") or [] if c.get("type", "").endswith("Pressure") and c.get("status") == "True"),
+            "unschedulable": bool((n.get("spec") or {}).get("unschedulable")),
+            "cpu": {"capacityCores": parse_quantity(cap.get("cpu")), "allocatableCores": parse_quantity(alloc.get("cpu"))},
+            "memory": {"capacityBytes": parse_quantity(cap.get("memory")), "allocatableBytes": parse_quantity(alloc.get("memory"))},
+            "ephemeralStorage": {"capacityBytes": parse_quantity(cap.get("ephemeral-storage")),
+                                 "allocatableBytes": parse_quantity(alloc.get("ephemeral-storage"))},
+            "podCapacity": parse_quantity(cap.get("pods")),
+            "usageSource": None,
+        }
+        r = kube.run("get", "--raw", f"/api/v1/nodes/{md['name']}/proxy/stats/summary", check=False, timeout=60)
+        summ = None
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                summ = (json.loads(r.stdout).get("node") or {})
+            except ValueError:
+                summ = None
+        if summ:
+            item["usageSource"] = "kubelet stats/summary"
+            cpu, mem, fs, ifs = summ.get("cpu") or {}, summ.get("memory") or {}, summ.get("fs") or {}, (summ.get("runtime") or {}).get("imageFs") or {}
+            if cpu.get("usageNanoCores") is not None:
+                item["cpu"]["usedCores"] = round(cpu["usageNanoCores"] / 1e9, 3)
+            item["memory"]["workingSetBytes"] = mem.get("workingSetBytes")
+            item["memory"]["availableBytes"] = mem.get("availableBytes")
+            item["ephemeralStorage"].update({"usedBytes": fs.get("usedBytes"), "availableBytes": fs.get("availableBytes"),
+                                             "fsCapacityBytes": fs.get("capacityBytes"), "imageFsUsedBytes": ifs.get("usedBytes"),
+                                             "inodesUsed": fs.get("inodesUsed"), "inodesFree": fs.get("inodesFree")})
+        else:
+            if metrics_api is None:
+                m = kube.run("get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes", check=False, timeout=60)
+                try:
+                    metrics_api = {x["metadata"]["name"]: x for x in json.loads(m.stdout).get("items", [])} if m.returncode == 0 else {}
+                except ValueError:
+                    metrics_api = {}
+                if not metrics_api:
+                    out["notes"].append("neither nodes/proxy stats/summary nor metrics.k8s.io is available: node usage not collected")
+            u = (metrics_api.get(md["name"]) or {}).get("usage") or {}
+            if u:
+                item["usageSource"] = "metrics.k8s.io"
+                item["cpu"]["usedCores"] = round(parse_quantity(u.get("cpu")) or 0, 3)
+                item["memory"]["workingSetBytes"] = parse_quantity(u.get("memory"))
+                out["notes"].append(f"{md['name']}: ephemeral storage usage needs nodes/proxy (stats/summary); not collected") \
+                    if not any(md["name"] in x for x in out["notes"]) else None
+        c, mm, e = item["cpu"], item["memory"], item["ephemeralStorage"]
+        if c.get("usedCores") is not None and c.get("allocatableCores"):
+            c["usedPctOfAllocatable"] = round(100 * c["usedCores"] / c["allocatableCores"], 1)
+        if mm.get("workingSetBytes") is not None and mm.get("allocatableBytes"):
+            mm["usedPctOfAllocatable"] = round(100 * mm["workingSetBytes"] / mm["allocatableBytes"], 1)
+        if e.get("usedBytes") is not None and (e.get("fsCapacityBytes") or e.get("capacityBytes")):
+            e["usedPct"] = round(100 * e["usedBytes"] / (e.get("fsCapacityBytes") or e["capacityBytes"]), 1)
+        if item["usageSource"] and item["usageSource"] not in out["usageSources"]:
+            out["usageSources"].append(item["usageSource"])
+        out["items"].append(item)
+    out["items"].sort(key=lambda x: (0 if "worker" in x["roles"] else 1, x["name"]))
+    tot = {"nodes": len(out["items"]),
+           "cpuAllocatableCores": sum(x["cpu"].get("allocatableCores") or 0 for x in out["items"]),
+           "cpuUsedCores": sum(x["cpu"].get("usedCores") or 0 for x in out["items"]),
+           "memoryAllocatableBytes": sum(x["memory"].get("allocatableBytes") or 0 for x in out["items"]),
+           "memoryWorkingSetBytes": sum(x["memory"].get("workingSetBytes") or 0 for x in out["items"]),
+           "ephemeralCapacityBytes": sum(x["ephemeralStorage"].get("fsCapacityBytes") or x["ephemeralStorage"].get("capacityBytes") or 0 for x in out["items"]),
+           "ephemeralUsedBytes": sum(x["ephemeralStorage"].get("usedBytes") or 0 for x in out["items"])}
+    out["totals"] = tot
+    return out
+
+
+def ksm_pod_labels_exposed(prom, k10ns):
+    """Does kube-state-metrics expose pod labels (metric-labels-allowlist) for the K10
+    namespace? Any kube_pod_labels series there carrying a label_* label means yes. None
+    when the query itself fails. Without it, datamover usage cannot be attributed to a
+    namespace or policy (README, "Datamover CPU/memory")."""
+    try:
+        res = prom.query('kube_pod_labels{namespace="%s"}' % k10ns)
+    except Exception:  # noqa: BLE001
+        return None
+    if not res:
+        return None
+    return any(k.startswith("label_") for r in res for k in (r.get("metric") or {}))
+
+
+def datamover_metrics(prom, k10ns, pod_regex, start, end):
+    """Peak of the SUM of datamover memory, peak sum CPU rate and CPU-seconds consumed
+    across every datamover pod alive in [start, end], plus per-pod figures attributed
+    to a namespace through kube_pod_labels (guide 09).
+
+    Not per PVC: copy-vol-data pods mount an ephemeral clone, not the source. The join
+    on kube_pod_labels gives namespace and job, which is what OpenShift's KSM exposes
+    thanks to --metric-labels-allowlist=pods=[*]."""
+    if not (prom and prom.available):
+        return None
+    s = start - METRICS_PAD_SECONDS
+    e = end + METRICS_PAD_SECONDS
+    sel = 'namespace="%s",pod=~"%s",container!="",container!="POD"' % (k10ns, pod_regex)
+    out = {"windowStart": iso(dt.datetime.fromtimestamp(s, dt.timezone.utc)),
+           "windowEnd": iso(dt.datetime.fromtimestamp(e, dt.timezone.utc)),
+           "samples": 0, "pods": []}
+    try:
+        mem = prom.query_range("sum by (pod) (container_memory_working_set_bytes{%s})" % sel, s, e)
+        cpu = prom.query_range("sum by (pod) (container_cpu_usage_seconds_total{%s})" % sel, s, e)
+        labels = prom.query_range('kube_pod_labels{namespace="%s",pod=~"%s"}' % (k10ns, pod_regex), s, e)
+    except Exception as ex:  # noqa: BLE001
+        out["error"] = str(ex)
+        return out
+
+    # attribution: job_id -> app namespace, from the data-mover-svc pods that carry app-name
+    job_ns = {}
+    pod_labels = {}
+    for r in labels:
+        m = r["metric"]
+        pod_labels[m["pod"]] = m
+        if m.get("label_k10_kasten_io_job_id") and m.get("label_app_name"):
+            job_ns.setdefault(m["label_k10_kasten_io_job_id"], m["label_app_name"])
+
+    # memory: per-pod peak and the peak of the sum across pods at each timestamp
+    sum_at = {}
+    pods = {}
+    for r in mem:
+        pod = r["metric"]["pod"]
+        vals = [(float(t), float(v)) for t, v in r["values"]]
+        if not vals:
+            continue
+        pods.setdefault(pod, {})["peakMemoryBytes"] = int(max(v for _, v in vals))
+        for t, v in vals:
+            sum_at[t] = sum_at.get(t, 0.0) + v
+    for r in cpu:
+        pod = r["metric"]["pod"]
+        vals = [float(v) for _, v in r["values"]]
+        if len(vals) >= 2:
+            pods.setdefault(pod, {})["cpuSeconds"] = round(max(vals) - min(vals), 3)
+        elif vals:
+            pods.setdefault(pod, {})["cpuSeconds"] = 0.0
+
+    out["samples"] = len(sum_at)
+    out["peakSumMemoryBytes"] = int(max(sum_at.values())) if sum_at else None
+    # CPU: total seconds across pods, and the average rate over the window
+    total_cpu = sum(p.get("cpuSeconds", 0.0) for p in pods.values())
+    out["cpuSecondsTotal"] = round(total_cpu, 3)
+    out["avgCpuCores"] = round(total_cpu / max(e - s, 1), 4)
+    out["podsWithoutSamples"] = []
+    for pod, p in sorted(pods.items()):
+        lab = pod_labels.get(pod, {})
+        job = lab.get("label_k10_kasten_io_job_id")
+        # a pod that only ever shows a 0 working set lived less than one kubelet scrape
+        # interval; listing it as a "peak of 0" would be misleading (guide 09)
+        if not p.get("peakMemoryBytes") and not p.get("cpuSeconds"):
+            out["podsWithoutSamples"].append(pod)
+            continue
+        out["pods"].append({
+            "pod": pod,
+            "appNamespace": lab.get("label_app_name") or job_ns.get(job),
+            "policy": lab.get("label_policy_name"),
+            "jobId": job,
+            "peakMemoryBytes": p.get("peakMemoryBytes"),
+            "cpuSeconds": p.get("cpuSeconds"),
+        })
+    if not sum_at:
+        out["note"] = ("no cAdvisor samples in this window: the datamover pod lived less than one "
+                       "scrape interval, or the window predates the metrics retention")
+    return out
+
+
+def k10tools_cause_chain(text):
+    """k10tools prints `Error: {"message":...,"cause":{...}}`; causes nest, and any level may be
+    a JSON document encoded as a string or a message that is itself JSON. Return the flat
+    list of messages, outermost first."""
+    m = re.search(r"^Error: (\{.*)$", ANSI_RE.sub("", text), re.M)
+    if not m:
+        return []
+    out = []
+
+    def walk(o, depth=0):
+        if depth > 12:
+            return
+        if isinstance(o, str):
+            st = o.strip()
+            if st.startswith("{"):
+                try:
+                    walk(json.loads(st), depth + 1)
+                    return
+                except ValueError:
+                    pass
+            out.append(st)
+            return
+        if isinstance(o, dict):
+            if "message" in o:
+                walk(o["message"], depth + 1)
+            if "cause" in o:
+                walk(o["cause"], depth + 1)
+    walk(m.group(1))
+    return out
+
+
+def enrich_orphans(kube, orphans, profiles, cluster_uid=None):
+    """repo_checker only names a repository it cannot inventory. The StorageRepository CR
+    knows the rest: owning namespace, profile label, content type and the object-store
+    location. "failed to find a profile with given location information" does not always
+    mean the profile is gone - on a lab cluster 4 of 5 had a live profile whose path prefix
+    k10tools could not match to the repository path - so say which case it is."""
+    crs = (kube.get("storagerepositories.repositories.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]
+    by_name = {c["metadata"]["name"]: c for c in crs}
+    for o in orphans:
+        cr = by_name.get(o["repository"])
+        if not cr:
+            o["note"] = "no StorageRepository CR with this name in the K10 namespace"
+            continue
+        lab = cr["metadata"].get("labels") or {}
+        st = cr.get("status") or {}
+        store = ((st.get("location") or {}).get("objectStore") or {})
+        prof = lab.get("k10.kasten.io/exportProfile")
+        o.update({"namespace": lab.get("k10.kasten.io/appName"), "profile": prof,
+                  "profileExistsOnCluster": prof in profiles if prof else None,
+                  "contentType": st.get("contentType"), "backendType": st.get("backendType"),
+                  "objectStoreType": store.get("objectStoreType") or o.get("objectStoreType"),
+                  "bucket": store.get("name") or o.get("bucket"), "path": store.get("path") or o.get("path"),
+                  "region": store.get("region") or o.get("region"), "fileStore": (st.get("location") or {}).get("fileStore")})
+        m = re.search(r"k10/([0-9a-f-]{36})/", o.get("path") or "")
+        foreign = m.group(1) if (m and cluster_uid and m.group(1) != cluster_uid) else None
+        if foreign:
+            o["clusterUidInPath"] = foreign
+        chain = o.get("k10toolsError") or []
+        # innermost cause, with its parent when it is too terse to stand alone ("no profile")
+        said = chain[-1] if chain else None
+        if said and len(said) < 30 and len(chain) > 1:
+            said = f"{chain[-2]}: {said}"
+        facts = []
+        if foreign:
+            facts.append(f"written by another K10 installation (cluster UID {foreign} in the path)")
+        if prof and prof in profiles:
+            facts.append(f"profile {prof} still exists")
+        elif prof:
+            facts.append(f"profile {prof} no longer exists")
+        else:
+            facts.append("no profile label on the StorageRepository")
+        o["reason"] = (f"k10tools: {said}" if said else "repo_checker cannot inventory it") + " — " + "; ".join(facts)
+    return orphans
+
+
+# --------------------------------------------------------------------------- repo_checker
+
+class ConnectError(RuntimeError):
+    """repo_checker -o connect reported a failure (cause chain in the message)."""
+
+
+class RepoChecker:
+    def __init__(self, kube, path, version, workdir, keep_pods=False):
+        self.kube = kube
+        self.workdir = workdir
+        self.keep_pods = keep_pods
+        self.created_pods = []
+        self.deleting_pods = []
+        self.path = path or self._download(version)
+
+    def _download(self, version):
+        dst = os.path.join(self.workdir, "k10_repo_checker.sh")
+        url = REPO_CHECKER_URL.format(version=version)
+        log(f"downloading {url}")
+        try:
+            urllib.request.urlretrieve(url, dst)
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"cannot download repo_checker for K10 {version}: {e}. Use --repo-checker PATH.")
+        os.chmod(dst, 0o755)
+        return dst
+
+    def _run(self, *args, timeout=1800):
+        env = dict(os.environ)
+        if self.kube.context:
+            # repo_checker calls bare kubectl; honour the requested context without a kubeconfig edit
+            r = self.kube.run("config", "view", "--minify", "--flatten", "--raw", check=False)
+            if r.returncode == 0:
+                kc = os.path.join(self.workdir, "kubeconfig")
+                with open(kc, "w") as f:
+                    f.write(r.stdout)
+                os.chmod(kc, 0o600)
+                env["KUBECONFIG"] = kc
+        # repo_checker prints k10tools progress (catalog scan, repository connects) as coloured
+        # log lines; stream them so a multi-minute run is visibly alive. Quiet by default:
+        # a heartbeat every 30 s with the last line seen; --verbose echoes every line.
+        # repo_checker writes its pod manifest (repo-checker.yaml) to the current directory and
+        # deletes it afterwards; run it in this run's private workdir so two generators on one
+        # machine (or a stray file in the caller's directory) cannot interfere
+        proc = subprocess.Popen([os.path.abspath(self.path), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=env, cwd=self.workdir)
+        lines, last = [], {"line": "", "seen": time.monotonic(), "printed": time.monotonic()}
+
+        def reader():
+            for line in proc.stdout:
+                lines.append(line)
+                clean = ANSI_RE.sub("", line).rstrip()
+                if clean and not clean.startswith(("{", "}", '"', " ")):
+                    last["line"], last["seen"] = clean, time.monotonic()
+                    if VERBOSE:
+                        log(f"    repo_checker> {clean[:160]}")
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        t0 = time.monotonic()
+        while th.is_alive():
+            th.join(1.0)
+            if time.monotonic() - t0 > timeout:
+                proc.kill()
+                raise RuntimeError(f"repo_checker {' '.join(args)} exceeded {timeout}s")
+            if not VERBOSE and time.monotonic() - last["printed"] >= 30:
+                last["printed"] = time.monotonic()
+                log(f"    repo_checker running for {int(time.monotonic() - t0)}s - last: {last['line'][:120] or '(no output yet)'}")
+        proc.wait()
+        return "".join(lines)
+
+    @staticmethod
+    def _extract_json(out):
+        # the JSON is wrapped in coloured progress lines (guide 12 step 1)
+        lines = out.splitlines()
+        try:
+            a = next(i for i, l in enumerate(lines) if l.strip() == "{")
+            b = max(i for i, l in enumerate(lines) if l.strip() == "}")
+        except (StopIteration, ValueError):
+            return None
+        try:
+            return json.loads("\n".join(lines[a:b + 1]))
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _orphan_from_error(out):
+        """k10tools aborts the whole inventory on the first repository whose Location Profile
+        no longer exists ("failed to find a profile with given location information").
+        Pull the repository name and its object-store location out of the error, because
+        that repository is itself a finding: data on a store that nothing references."""
+        flat = out.replace('\\"', '"')
+        m = re.search(r"failed to list snapshots for repository ([A-Za-z0-9-]+)", flat)
+        if not m:
+            return None
+        o = {"repository": m.group(1), "reason": "repo_checker cannot inventory this repository",
+             "k10toolsError": k10tools_cause_chain(out)}
+        loc = re.search(r'"objectStore":\{([^}]*)\}', flat)
+        if loc:
+            for k in ("name", "objectStoreType", "path", "region"):
+                mm = re.search(r'"%s":"([^"]*)"' % k, loc.group(1))
+                if mm:
+                    o[{"name": "bucket"}.get(k, k)] = mm.group(1)
+        return o
+
+    def inventory(self, profile_names, full=True):
+        """Full inventory when it works; otherwise one inventory per existing profile,
+        merged. Repositories whose profile is gone cannot be listed at all by repo_checker
+        and are returned separately as orphans. A focused run (--namespace/--policy) passes
+        only the profiles it needs and full=False: every inventory re-scans the whole
+        catalog, so eight of them cost nine minutes for a single pair on a lab cluster."""
+        orphans = []
+        if full:
+            out = self._run("-r", "inventory", "-F", "json", "-n", self.kube.k10ns)
+            js = self._extract_json(out)
+            if js is not None:
+                return js, []
+            o = self._orphan_from_error(out)
+            if o:
+                orphans.append(o)
+                warn(f"repository {o['repository']} references a deleted Location Profile "
+                     f"({o.get('bucket', '?')}/{o.get('path', '?')}); repo_checker aborts the full inventory on it - "
+                     f"falling back to one inventory per profile")
+            else:
+                warn("full inventory produced no JSON; falling back to one inventory per profile. Tail:\n" + out[-800:])
+        merged = {"repositories": [], "timestamp": None}
+        for prof in profile_names:
+            log(f"  inventory for profile {prof} ...")
+            out = self._run("-r", "inventory", "-F", "json", "-p", prof, "-n", self.kube.k10ns)
+            js = self._extract_json(out)
+            if js is None:
+                if "No storage repositories found" in out:
+                    continue
+                o = self._orphan_from_error(out)
+                if o and o not in orphans:
+                    orphans.append(o)
+                warn(f"inventory for profile {prof} produced no JSON" +
+                     (f" - k10tools cannot match repository {o['repository']} to a profile" if o else ""))
+                continue
+            merged["repositories"].extend(js.get("repositories") or [])
+            merged["timestamp"] = js.get("timestamp") or merged["timestamp"]
+        if not merged["repositories"] and not orphans:
+            raise SystemExit("repo_checker produced no inventory for any profile")
+        return merged, orphans
+
+    def _debug_pods(self):
+        r = self.kube.run("-n", self.kube.k10ns, "get", "pods", "-o", "name", check=False)
+        return {l.split("/", 1)[1] for l in r.stdout.split() if "debug-kopia" in l}
+
+    @staticmethod
+    def _connect_cause(out):
+        """k10tools reports connect failures as a JSON status block whose StatusMessage embeds
+        an escaped error chain. Return the chain's messages, innermost last."""
+        m = re.search(r'"StatusMessage":\s*"(.*?)"\s*\n', out, re.S)
+        if not m:
+            return []
+        try:
+            inner = m.group(1).encode().decode("unicode_escape")
+            j = inner[inner.find("{"): inner.rfind("}") + 1]
+            d = json.loads(j)
+            chain = []
+            while isinstance(d, dict):
+                if d.get("message"):
+                    chain.append(d["message"])
+                d = d.get("cause")
+            return chain
+        except Exception:  # noqa: BLE001
+            return [m.group(1)[:200]]
+
+    def connect(self, application, profile):
+        """Leave a debug-kopia pod connected read-only to the application repository.
+        Returns the pod name. repo_checker does not clean it up; we do - including the pod
+        it leaves behind when the connect itself fails."""
+        before = self._debug_pods()
+        out = self._run("-r", "application", "-o", "connect", "-a", application, "-p", profile,
+                        "-n", self.kube.k10ns)
+        m = re.search(r"Pod Name:\s*(debug-kopia-[a-z0-9]+)", out)
+        if not m or '"StatusCode": "Error"' in out:
+            for pod in self._debug_pods() - before:
+                self.kube.run("-n", self.kube.k10ns, "delete", "pod", pod, "--wait=false", check=False)
+            chain = self._connect_cause(out)
+            if not chain:
+                tail = [ANSI_RE.sub("", l).strip() for l in out.splitlines()]
+                tail = [l for l in tail if l and not l.startswith(("Profile:", "Application Name:", "Operation:",
+                                                                   "K10 Namespace:", "Repo type:"))]
+                chain = tail[-2:]
+            raise ConnectError(" -> ".join(chain))
+        pod = m.group(1)
+        self.created_pods.append(pod)
+        self.kube.run("-n", self.kube.k10ns, "wait", "--for=condition=Ready", f"pod/{pod}",
+                      "--timeout=180s", check=False)
+        return pod
+
+    def cleanup(self, wait=False):
+        """Delete the debug pods this run created. Between namespaces the deletion is
+        asynchronous; the final call (wait=True) waits for every pod deleted during the run
+        to be gone, so "no debug pod left" holds the moment the script exits and a user
+        checking right away does not see a Terminating pod."""
+        if self.keep_pods:
+            if self.created_pods:
+                log(f"keeping debug pods: {', '.join(self.created_pods)}")
+            return
+        for pod in self.created_pods:
+            self.kube.run("-n", self.kube.k10ns, "delete", "pod", pod, "--grace-period=5", "--wait=false", check=False)
+            self.deleting_pods.append(pod)
+        self.created_pods = []
+        if wait and self.deleting_pods:
+            self.kube.run("-n", self.kube.k10ns, "wait", "--for=delete", "--timeout=90s",
+                          *[f"pod/{p}" for p in self.deleting_pods], check=False)
+            self.deleting_pods = []
+
+
+KOPIA_PREFIX = "export KOPIA_CONFIG_PATH=/tmp/kopia-repository.config; "
+
+
+def kopia_json(kube, pod, cmd, retries=1):
+    """Run a kopia command with --json in the debug pod. kopia writes log-directory noise to
+    stderr, so only stdout is parsed; the pod has no jq, parsing happens here. Once on a
+    lab cluster a command returned something that was not clean JSON (a warning line ahead of
+    the document) and the whole namespace was lost: tolerate leading/trailing noise and
+    retry once before giving up, and keep the offending text in the error."""
+    last = None
+    for attempt in range(retries + 1):
+        out, err, rc = kube.exec(kube.k10ns, pod, KOPIA_PREFIX + cmd + " --json 2>/dev/null\n")
+        if not out.strip():
+            last = RuntimeError(f"kopia {cmd}: no output (rc={rc}) {err.strip()[:200]}")
+            continue
+        try:
+            return json.loads(out)
+        except ValueError as e:
+            # take the outermost JSON document if noise surrounds it
+            starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+            ends = [i for i in (out.rfind("]"), out.rfind("}")) if i >= 0]
+            if starts and ends:
+                try:
+                    return json.loads(out[min(starts):max(ends) + 1])
+                except ValueError:
+                    pass
+            last = RuntimeError(f"kopia {cmd}: output is not JSON ({e}); starts with: {out.strip()[:160]!r}")
+    raise last
+
+
+def last_content_rewrite(maint):
+    """Epoch of the last successful full-rewrite-contents that actually rewrote something.
+    Maintenance re-stamps every rewritten content and pack blob with the maintenance time,
+    so per-snapshot attribution by timestamp is impossible for anything older than that.
+    Validated: a 3-day-old repository had all its contents dated at the maintenance run."""
+    runs = ((maint.get("schedule") or {}).get("runs") or {}).get("full-rewrite-contents") or []
+    last = None
+    for r in runs:
+        if not r.get("success"):
+            continue
+        n = 0
+        for x in r.get("extra") or []:
+            n = max(n, ((x.get("data") or {}).get("rewrittenContentCount") or 0))
+        if n > 0:
+            t = parse_rfc3339(r.get("start"))
+            if t and (last is None or epoch(t) > last):
+                last = epoch(t)
+    return last
+
+
+def assign_contents(contents, snaps, pad=1):
+    """Give every live content block to exactly ONE snapshot: the one whose padded window
+    contains its timestamp and whose midpoint is nearest. Content timestamps are whole
+    seconds, and consecutive PVC snapshots of one export run within the same second, so
+    naive per-window sums double count - the five mastodon snapshots summed to 2.3x the
+    repository. Returns {snapshot id: {"physical", "logical", "count"}} plus
+    {"_unassigned": ...} for contents matching no window."""
+    wins = []
+    for sn in snaps:
+        st, en = parse_rfc3339(sn["startTime"]), parse_rfc3339(sn["endTime"])
+        if st and en:
+            wins.append((epoch(st) - pad, epoch(en) + pad, (epoch(st) + epoch(en)) / 2, sn.get("id")))
+    out = {}
+    for c in contents:
+        if c.get("deleted"):
+            continue
+        t = c.get("time")
+        if t is None:
+            continue
+        best, hits = None, 0
+        for lo, hi, mid, sid in wins:
+            if lo <= t <= hi:
+                hits += 1
+                d = abs(t - mid)
+                if best is None or d < best[0]:
+                    best = (d, sid)
+        key = best[1] if best else "_unassigned"
+        o = out.setdefault(key, {"physical": 0, "logical": 0, "count": 0, "ambiguous": 0})
+        o["physical"] += c.get("length", 0)
+        o["logical"] += c.get("originalLength", c.get("length", 0))
+        o["count"] += 1
+        if hits > 1:
+            # several PVCs of the namespace were being exported at that moment (VM disks are
+            # exported concurrently): the winner is the nearest window, which is a guess
+            o["ambiguous"] += c.get("length", 0)
+    return out
+
+
+def written_in_window(items, tkey, lo, hi, is_pack=lambda x: True):
+    """Count and bytes of items whose timestamp lies in [lo, hi]. Used for content blocks
+    (physical ingest) and for pack blobs (objects that reached the object store)."""
+    n = b = 0
+    for it in items:
+        if not is_pack(it):
+            continue
+        t = it.get(tkey)
+        if isinstance(t, str):
+            d = parse_rfc3339(t)
+            t = epoch(d) if d else None
+        if t is None or not (lo <= t <= hi):
+            continue
+        n += 1
+        b += it.get("length", 0)
+    return n, b
+
+
+def snapshot_mode(sn):
+    """K10 stores block-mode volumes (KubeVirt disks, and any volume exported in block
+    mode) as a chunk tree: the root holds "meta:*" entries (BlockSzB, VolSnapID, ...) and
+    a c/ directory of fixed-size chunks. Kopia's stats then report fileCount = number of
+    chunks and totalFileSize = null; the real logical size is rootEntry.summ.fileSize.
+    The description reads "volume:<pvc>:<csi-snapshot>" and the path is /volume/<pvc>."""
+    desc = sn.get("description") or ""
+    path = (sn.get("source") or {}).get("path") or ""
+    return "block" if desc.startswith("volume:") or path.startswith("/volume/") else "filesystem"
+
+
+def snapshot_size_files(sn):
+    """(logical bytes, file or chunk count) of the snapshot TREE, from rootEntry.summ.
+    stats.fileCount is not that: it counts the files Kopia processed in this run (a
+    mastodon volume showed stats.fileCount 14 for a 167-file tree on its second snapshot),
+    so it is exposed separately as filesHashed. summ.fileSize is also the only real size of
+    a block-mode snapshot (summ.size and stats.totalFileSize are 0 / null there)."""
+    stats = sn.get("stats") or {}
+    summ = (sn.get("rootEntry") or {}).get("summ") or {}
+    size = summ.get("fileSize")
+    if size is None:
+        size = stats.get("totalFileSize")
+    files = summ.get("files")
+    if files is None:
+        files = stats.get("fileCount")
+    return size, files
+
+
+def snapshot_files_hashed(sn):
+    """(hashed, unchanged): files Kopia had to read and hash in this run, and files it skipped
+    as unchanged against the previous snapshot (stats.cachedFiles - 0 on a first snapshot).
+    Validated on the reference cluster: second snapshot of a 167-file volume -> fileCount 14, cachedFiles 153.
+    A per-PVC change indicator that survives maintenance. Meaningless in block mode, where
+    cachedFiles holds the block size."""
+    if snapshot_mode(sn) == "block":
+        return None, None
+    stats = sn.get("stats") or {}
+    return stats.get("fileCount"), stats.get("cachedFiles")
+
+
+def kopia_block_size(kube, pod, root):
+    """BlockSzB from the meta entries of a block-mode root, hex, e.g. meta:BlockSzB:100000."""
+    out, _, _ = kube.exec(kube.k10ns, pod, KOPIA_PREFIX + f"kopia ls {root} 2>/dev/null\n")
+    m = re.search(r"meta:BlockSzB:([0-9a-fA-F]+)", out)
+    return int(m.group(1), 16) if m else None
+
+
+def kopia_ls_sizes(kube, pod, root):
+    """File sizes of a snapshot tree from `kopia ls -l -r`: mode size date time UTC objid path.
+    Directories start with 'd'; only regular files count. The path is the tail and may
+    contain spaces, so split only the first six fields."""
+    out, _, _ = kube.exec(kube.k10ns, pod, KOPIA_PREFIX + f"kopia ls -l -r {root} 2>/dev/null\n")
+    sizes = []
+    for line in out.splitlines():
+        if not line.startswith("-"):
+            continue
+        parts = line.split(None, 6)
+        if len(parts) >= 2:
+            try:
+                sizes.append(int(parts[1]))
+            except ValueError:
+                pass
+    return sizes
+
+
+def histogram(sizes):
+    h = {name: {"files": 0, "bytes": 0} for name, _ in HISTOGRAM_BUCKETS}
+    for s in sizes:
+        for name, upper in HISTOGRAM_BUCKETS:
+            if upper is None or s < upper:
+                h[name]["files"] += 1
+                h[name]["bytes"] += s
+                break
+    srt = sorted(sizes)
+    return {
+        "buckets": h,
+        "fileCount": len(sizes),
+        "minBytes": srt[0] if srt else None,
+        "medianBytes": srt[len(srt) // 2] if srt else None,
+        "maxBytes": srt[-1] if srt else None,
+    }
+
+
+# --------------------------------------------------------------------------- scope from policies
+
+NS_LITERAL = re.compile(r"^[A-Za-z0-9]+[A-Za-z0-9_-]*$")
+NS_PREFIX = re.compile(r"^[A-Za-z0-9]+[A-Za-z0-9_-]*\*$")
+
+
+def policy_targets(policies, namespaces, excluded):
+    """(namespace, export profile) pairs selected by policies that have an export action -
+    the scope rule (CLAUDE.md, lib/policies.sh). Selector values are literal names, a
+    trailing glob, or bare '*', plus real namespace labels; NotIn subtracts; namespaces in
+    excludedApps are invisible to K10. VM selectors are reported, not resolved.
+
+    This does not depend on repo_checker, so discovery survives an inventory that aborts
+    on a repository with a deleted profile. Whether a selected namespace actually holds
+    exported data is decided later by reading its Kopia repository."""
+    visible = {n["metadata"]["name"]: (n["metadata"].get("labels") or {}) for n in namespaces
+               if n["metadata"]["name"] not in excluded}
+    out = {}
+    for name, pol in policies.items():
+        spec = pol.get("spec") or {}
+        exp = next((a for a in spec.get("actions") or [] if a.get("action") == "export"), None)
+        if not exp:
+            continue
+        ep = exp.get("exportParameters") or {}
+        if not (ep.get("exportData") or {}).get("enabled"):
+            continue
+        profile = (ep.get("profile") or {}).get("name")
+        sel = spec.get("selector") or {}
+        exprs = sel.get("matchExpressions") or []
+        # VM policies (KubeVirt) select VMs, not namespaces, but a VM's disks are PVCs in the
+        # VM's namespace and the export lands in that namespace's repository - so only the
+        # namespace needs resolving and the Kopia read is identical:
+        #   virtualMachineRef        In/NotIn  "namespace/vm-name"  (name may be a glob)
+        #   virtualMachineNamespace  In/NotIn  namespace globs; matchLabels then apply to VM
+        #                                      labels, which we do not evaluate - the
+        #                                      repository decides whether anything was exported
+        is_vm = any((e.get("key") or "").startswith("k10.kasten.io/virtualMachine") for e in exprs)
+        include, exclude, label_terms = [], [], []
+        if not is_vm:
+            label_terms = list((sel.get("matchLabels") or {}).items())
+        label_exprs = []
+        for e in exprs:
+            k, op, vals = e.get("key"), e.get("operator"), e.get("values") or []
+            if k == "k10.kasten.io/appNamespace":
+                (include if op == "In" else exclude if op == "NotIn" else []).extend(vals)
+            elif k == "k10.kasten.io/virtualMachineRef":
+                nss = [v.split("/", 1)[0] for v in vals if "/" in v]
+                (include if op == "In" else exclude if op == "NotIn" else []).extend(nss)
+            elif k == "k10.kasten.io/virtualMachineNamespace":
+                (include if op == "In" else exclude if op == "NotIn" else []).extend(vals)
+            elif k and not k.startswith("k10.kasten.io/"):
+                label_exprs.append((k, op, vals))
+
+        def expand(v):
+            if v == "kasten-io-cluster":
+                return set()
+            if v == "*":
+                return set(visible)
+            if NS_PREFIX.match(v):
+                return {n for n in visible if n.startswith(v[:-1])}
+            if NS_LITERAL.match(v):
+                return {v} if v in visible else set()
+            return set()
+
+        hits = set()
+        for v in include:
+            hits |= expand(v)
+        if label_terms or label_exprs:
+            for n, labels in visible.items():
+                ok = all(labels.get(k) == v for k, v in label_terms)
+                for k, op, vals in label_exprs:
+                    if op == "In":
+                        ok = ok and labels.get(k) in vals
+                    elif op == "NotIn":
+                        ok = ok and labels.get(k) not in vals
+                    elif op == "Exists":
+                        ok = ok and k in labels
+                    elif op == "DoesNotExist":
+                        ok = ok and k not in labels
+                    else:
+                        ok = False
+                if ok:
+                    hits.add(n)
+        for v in exclude:
+            hits -= expand(v)
+        for n in hits:
+            out.setdefault((n, profile), set()).add(name)
+        POLICY_KIND[name] = "vm" if is_vm else "namespace"
+    return out
+
+
+POLICY_KIND = {}
+
+
+# --------------------------------------------------------------------------- PVC name resolution
+
+def resolve_pvc(host, ns_pvcs):
+    """Source.host is <applicationID>.<workload>.<pvcName>; dots are legal in PVC names, so
+    match the longest live PVC name the host ends with, else fall back to structure
+    (lib/kopia.sh)."""
+    for name in sorted(ns_pvcs, key=len, reverse=True):
+        if host.endswith("." + name):
+            rest = host[: -len(name) - 1]
+            workload = rest.split(".", 1)[1] if "." in rest else ""
+            return name, workload, "live-pvc"
+    rest = host.split(".", 1)[1] if "." in host else host
+    workload, _, pvc = rest.partition(".")
+    return pvc or rest, workload, "structural"
+
+
+# --------------------------------------------------------------------------- main assembly
+
+def collect(args):
+    kube = Kube(args.context, args.k10_namespace)
+
+    # ---- cluster identity -------------------------------------------------------------
+    ctx = args.context or kube.run("config", "current-context", check=False).stdout.strip()
+    ver = kube.run("-n", kube.k10ns, "get", "cm", "k10-config", "-o", "jsonpath={.data.version}",
+                   check=False).stdout.strip()
+    if not ver:
+        raise SystemExit(f"no k10-config in namespace {kube.k10ns}: wrong --k10-namespace or no K10")
+    uid = kube.run("get", "ns", "default", "-o", "jsonpath={.metadata.uid}", check=False).stdout.strip()
+    log(f"cluster {ctx}  K10 {ver}  uid {uid}")
+
+    k10cfg = (kube.get("cm", "k10-config", ns=kube.k10ns) or {}).get("data", {})
+    limiters = {k: v for k, v in sorted(k10cfg.items()) if LIMITER_KEY_REGEX.match(k)}
+    features = (kube.get("cm", "k10-features", ns=kube.k10ns) or {}).get("data", {})
+
+    # ---- K10 objects --------------------------------------------------------------------
+    log("reading policies, profiles, export actions and PVCs ...")
+    policies = {p["metadata"]["name"]: p for p in (kube.get("policies.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
+    profiles = {p["metadata"]["name"]: p for p in (kube.get("profiles.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
+    apspecs = {p["metadata"]["name"]: p for p in (kube.get("actionpodspecs.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
+    bindings = (kube.get("actionpodspecbindings.config.kio.kasten.io", all_ns=True) or {"items": []})["items"]
+    # per-application exports live in the application namespace; the K10 namespace only
+    # holds the policy run's metadata export
+    export_actions = (kube.get("exportactions.actions.kio.kasten.io", all_ns=True) or {"items": []})["items"]
+    all_pvcs = (kube.get("pvc", all_ns=True) or {"items": []})["items"]
+    log(f"  {len(policies)} policies, {len(profiles)} profiles, {len(export_actions)} export actions, {len(all_pvcs)} PVCs")
+    with Step("node capacity and usage", indent=2) as stp:
+        nodes_info = collect_nodes(kube)
+        stp.note = f"{nodes_info['totals']['nodes']} nodes via {', '.join(nodes_info['usageSources']) or 'no usage source'}"
+    pvc_by_ns = {}
+    for p in all_pvcs:
+        pvc_by_ns.setdefault(p["metadata"]["namespace"], {})[p["metadata"]["name"]] = p
+
+    # ---- metrics ------------------------------------------------------------------------
+    prom = None
+    if not args.no_metrics:
+        prom = Prom(kube, url=args.prom_url, token=args.prom_token, prom_ns=args.prom_namespace,
+                    header=args.prom_header)
+        prom.init()
+        if prom.available:
+            log(f"metrics: {prom.url} ({prom.flavour}), retention ~{(prom.retention_seconds or 0)//86400} d")
+
+    # ---- inventory: what actually exists in the repositories -------------------------------
+    workdir = tempfile.mkdtemp(prefix="export-topology-")
+    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods)
+
+    # ---- scope: which (namespace, profile) pairs to read, from two independent sources ----
+    # 1. the export policies (the scope rule; never depends on repo_checker)
+    excluded = {x.strip() for x in (k10cfg.get("excludedApps") or "").split(",") if x.strip()}
+    all_ns = (kube.get("namespaces") or {"items": []})["items"]
+    targets = {}
+    for (ns, prof), pols in policy_targets(policies, all_ns, excluded).items():
+        if args.namespace and ns not in args.namespace:
+            continue
+        if args.policy:
+            # focus on one export problem: keep only the requested policies, and only the
+            # pairs they select
+            pols = [x for x in pols if x in args.policy]
+            if not pols:
+                continue
+        targets[(ns, prof)] = {"repo": None, "policies": set(pols), "inv_snaps": [], "source": "policy"}
+    if args.policy:
+        unknown = sorted(set(args.policy) - set(policies))
+        if unknown:
+            warn(f"--policy {', '.join(unknown)}: no such policy on the cluster")
+    # A namespace with no RestorePoint at all was never backed up, so it cannot have been
+    # exported; skip it before paying for a repository connect. VM policies selecting
+    # "*" otherwise expand to every namespace on the cluster (47 on a lab cluster).
+    with Step("restore points across namespaces", indent=2) as st:
+        rps = (kube.get("restorepoints.apps.kio.kasten.io", all_ns=True) or {"items": []})["items"]
+        st.note = f"{len(rps)}"
+    ns_with_rp = {r["metadata"]["namespace"] for r in rps}
+    skipped_no_rp = sorted({ns for (ns, _) in targets if ns not in ns_with_rp})
+    targets = {k: v for k, v in targets.items() if k[0] in ns_with_rp}
+    # the K10 namespace's own "export" is the disaster-recovery repository, a different kind
+    dr_targets = [k for k in targets if k[0] == kube.k10ns]
+    for k in dr_targets:
+        targets.pop(k)
+    log(f"scope from export policies: {len(targets)} namespace/profile pairs "
+        f"({len(skipped_no_rp)} selected namespaces have no restore point and were skipped)")
+
+    # 2. the repository inventory, when repo_checker can produce one (catches data whose
+    #    policy has since been deleted, and adds repository names, orphan counts, ...)
+    inv, orphan_repos = {"repositories": []}, []
+    if not args.no_inventory:
+        log("repo_checker inventory ...")
+        try:
+            focused = bool(args.namespace or args.policy)
+            inv_profiles = sorted({prof for (_, prof) in targets} & set(profiles)) if focused else sorted(profiles)
+            inv, orphan_repos = rc.inventory(inv_profiles, full=not focused)
+        except SystemExit as e:
+            warn(f"inventory unavailable: {e}; continuing from the export policies alone")
+        if orphan_repos:
+            enrich_orphans(kube, orphan_repos, profiles, uid)
+    data_repos = [r for r in inv.get("repositories", []) if r.get("Type") == "Data"]
+    log(f"  inventory: {len(inv.get('repositories', []))} repositories, {len(data_repos)} hold volume data")
+    for r in data_repos:
+        for s in r.get("Snapshots") or []:
+            ns = s.get("RestorePointNamespace")
+            if not ns or (args.namespace and ns not in args.namespace):
+                continue
+            key = (ns, r["ProfileName"])
+            if args.policy and key not in targets:
+                continue  # inventory snapshots carry no policy; a focused run stays with the policy's pairs
+            t = targets.setdefault(key, {"repo": None, "policies": set(), "inv_snaps": [], "source": "inventory"})
+            t["repo"] = r
+            if s.get("PolicyName"):
+                t["policies"].add(s["PolicyName"])
+            t["inv_snaps"].append(s)
+
+    if not targets:
+        warn("no export policy selects any namespace and no repository holds volume data - nothing to report")
+
+    # ---- per (namespace, profile): connect and read Kopia -----------------------------------
+    ns_results = {}
+    not_exported = []
+    try:
+        _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported)
+    finally:
+        rc.cleanup(wait=True)
+
+    return _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
+                     export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir, nodes_info)
+
+
+def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported):
+    total = len(targets)
+    for i, ((ns, prof), t) in enumerate(sorted(targets.items()), 1):
+        log(f"[{i}/{total}] connecting to repository of {ns} on profile {prof} ...")
+        try:
+            pod = rc.connect(ns, prof)
+        except ConnectError as e:
+            cause = str(e)
+            if "failed to connect to repository" in cause:
+                log(f"  {ns}/{prof}: no repository on this profile ({cause.split(' -> ')[-1]}) - never exported there")
+                not_exported.append({"namespace": ns, "profile": prof, "policies": sorted(t["policies"]),
+                                     "reason": cause})
+            else:
+                warn(f"{ns}/{prof}: connect failed: {cause}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            warn(f"{ns}/{prof}: {e}")
+            continue
+        try:
+            with Step("snapshot list") as st:
+                snaps = kopia_json(kube, pod, "kopia snapshot list --all")
+                st.note = f"{len(snaps)} snapshots, {len({s['source']['host'] for s in snaps})} sources"
+            if not snaps:
+                log(f"  {ns}/{prof}: selected by a policy but the repository holds no snapshots - out of scope")
+                rc.cleanup()
+                continue
+            maint = kopia_json(kube, pod, "kopia maintenance info")
+            if args.no_content_list:
+                contents = []
+            else:
+                with Step("content list") as st:
+                    contents = kopia_json(kube, pod, "kopia content list")
+                    st.note = f"{len(contents)} contents"
+            with Step("blob list") as st:
+                blobs = kopia_json(kube, pod, "kopia blob list")
+                st.note = f"{len(blobs)} blobs"
+            rstatus = kopia_json(kube, pod, "kopia repository status")
+        except Exception as e:  # noqa: BLE001
+            warn(f"{ns}/{prof}: {e}")
+            rc.cleanup()
+            continue
+
+        rewrite_ts = last_content_rewrite(maint)
+        assigned = assign_contents(contents, snaps) if contents else {}
+        if rewrite_ts:
+            log(f"  {ns}: contents re-stamped by maintenance at {iso(dt.datetime.fromtimestamp(rewrite_ts, dt.timezone.utc))}; "
+                f"physical ingest of earlier snapshots is unrecoverable")
+        ns_pvc_names = set(pvc_by_ns.get(ns, {}).keys())
+        by_source = {}
+        for s in snaps:
+            by_source.setdefault(s["source"]["host"], []).append(s)
+
+        pvcs = []
+        for j, (host, slist) in enumerate(sorted(by_source.items()), 1):
+            slist.sort(key=lambda x: x["startTime"])
+            pvc_name, workload, how = resolve_pvc(host, ns_pvc_names)
+            log(f"    pvc {j}/{len(by_source)} {pvc_name}: {len(slist)} snapshots ({snapshot_mode(slist[-1])} mode)")
+            live = pvc_by_ns.get(ns, {}).get(pvc_name)
+            entry = {
+                "name": pvc_name,
+                "workload": workload or None,
+                "sourceHost": host,
+                "resolvedBy": how,
+                "storageClass": (live or {}).get("spec", {}).get("storageClassName") if live else None,
+                "accessMode": ((live or {}).get("spec", {}).get("accessModes") or [None])[0] if live else None,
+                "requestedStorage": ((live or {}).get("spec", {}).get("resources", {}).get("requests") or {}).get("storage") if live else None,
+                "existsOnCluster": live is not None,
+            }
+            snap_entries = []
+            prev = None
+            mode = snapshot_mode(slist[-1])
+            for s in slist:
+                st, en = parse_rfc3339(s["startTime"]), parse_rfc3339(s["endTime"])
+                stats = s.get("stats", {})
+                size_b, files_n = snapshot_size_files(s)
+                se = {
+                    "id": s.get("id"),
+                    "startTime": s["startTime"],
+                    "endTime": s["endTime"],
+                    "durationSeconds": round(epoch(en) - epoch(st), 3) if st and en else None,
+                    "mode": snapshot_mode(s),
+                    "fileCount": files_n,
+                    "filesHashed": snapshot_files_hashed(s)[0],
+                    "filesUnchanged": snapshot_files_hashed(s)[1],
+                    "dirCount": stats.get("dirCount"),
+                    "totalSizeBytes": size_b,
+                    "errorCount": stats.get("errorCount"),
+                    "rootObjectId": (s.get("rootEntry") or {}).get("obj"),
+                }
+                # change rate: logical net growth vs previous snapshot of the same source;
+                # physical ingest = content blocks whose creation time falls in the window.
+                # SizeBytes/totalFileSize is the logical size, not the increment (guide 06).
+                if prev is not None:
+                    psize, pfiles = snapshot_size_files(prev)
+                    se["logicalDeltaBytes"] = (size_b or 0) - (psize or 0)
+                    se["logicalDeltaFiles"] = (files_n or 0) - (pfiles or 0)
+                    pst = parse_rfc3339(prev["startTime"])
+                    se["intervalSinceLastSeconds"] = round(epoch(st) - epoch(pst), 1) if st and pst else None
+                if contents and st and en:
+                    if rewrite_ts and epoch(en) < rewrite_ts:
+                        se["physicalIngestBytes"] = None
+                        se["physicalIngestNote"] = ("unrecoverable: full-rewrite-contents maintenance on %s re-stamped every "
+                                                    "content written before it" % iso(dt.datetime.fromtimestamp(rewrite_ts, dt.timezone.utc)))
+                    else:
+                        a = assigned.get(s.get("id"), {"physical": 0, "logical": 0, "count": 0, "ambiguous": 0})
+                        phys, logi = a["physical"], a["logical"]
+                        se["physicalIngestBytes"] = phys
+                        se["logicalIngestBytes"] = logi
+                        se["physicalIngestContents"] = a["count"]
+                        if a.get("ambiguous"):
+                            se["physicalIngestAmbiguousBytes"] = a["ambiguous"]
+                            se["physicalIngestNote"] = ("%d of these bytes were written while another PVC of the namespace "
+                                                        "was also being exported; attributed to the nearest window" % a["ambiguous"])
+                        se["compressionDedupRatio"] = round(phys / logi, 3) if logi else None
+                        if phys == 0 and (stats.get("totalFileSize") or 0) > 0 and prev is None:
+                            se["physicalIngestNote"] = "0 bytes for a first snapshot is unexpected - contents may have been compacted"
+                if st and en:
+                    if prom and prom.retention_seconds and (time.time() - epoch(st)) > prom.retention_seconds:
+                        se["datamover"] = {"note": "snapshot predates the metrics retention window"}
+                    else:
+                        se["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(st), epoch(en))
+                snap_entries.append(se)
+                prev = s
+
+            last = slist[-1]
+            lstats = last.get("stats", {})
+            lsize, lfiles = snapshot_size_files(last)
+            root = (last.get("rootEntry") or {}).get("obj")
+            entry["mode"] = mode
+            entry["dirCount"] = lstats.get("dirCount")
+            entry["lastSnapshotTime"] = last["startTime"]
+            entry["snapshotCount"] = len(slist)
+
+            if mode == "block":
+                # chunks, not files: the histogram would be N entries of size 0
+                entry["fileCount"] = None
+                entry["chunkCount"] = lfiles
+                entry["totalSizeBytes"] = lsize
+                entry["averageFileSizeBytes"] = None
+                entry["blockSizeBytes"] = kopia_block_size(kube, pod, root) if root else None
+                entry["sizeHistogram"] = {"skipped": "block-mode volume: the tree holds fixed-size chunks, not files"}
+            else:
+                entry["fileCount"] = lfiles
+                entry["totalSizeBytes"] = lsize
+                if args.no_histogram:
+                    entry["sizeHistogram"] = None
+                elif (lfiles or 0) > args.histogram_max_files:
+                    entry["sizeHistogram"] = {"skipped": f"{lfiles} files exceeds --histogram-max-files {args.histogram_max_files}"}
+                else:
+                    try:
+                        with Step("tree listing", indent=6) as st:
+                            sizes = kopia_ls_sizes(kube, pod, root) if root else []
+                            st.note = f"{len(sizes)} files"
+                        entry["sizeHistogram"] = histogram(sizes)
+                        # some filesystem snapshots carry stats.fileCount = 0 although the
+                        # tree is populated (seen on CloudNativePG volumes); the listing wins
+                        if not entry["fileCount"] and sizes:
+                            entry["fileCount"] = len(sizes)
+                            entry["fileCountSource"] = "tree listing"
+                        if not entry["totalSizeBytes"] and sizes:
+                            entry["totalSizeBytes"] = sum(sizes)
+                    except Exception as e:  # noqa: BLE001
+                        entry["sizeHistogram"] = {"error": str(e)}
+                fc = entry.get("fileCount") or 0
+                entry["averageFileSizeBytes"] = int((entry.get("totalSizeBytes") or 0) / fc) if fc else None
+
+            # last change rate from the last two snapshots
+            if len(snap_entries) >= 2:
+                lse = snap_entries[-1]
+                iv = lse.get("intervalSinceLastSeconds") or 0
+                entry["lastChangeRate"] = {
+                    "from": snap_entries[-2]["startTime"], "to": lse["startTime"],
+                    "intervalSeconds": iv,
+                    "logicalDeltaBytes": lse.get("logicalDeltaBytes"),
+                    "logicalDeltaFiles": lse.get("logicalDeltaFiles"),
+                    "physicalIngestBytes": lse.get("physicalIngestBytes"),
+                    "physicalIngestBytesPerDay": round(lse["physicalIngestBytes"] * 86400 / iv) if lse.get("physicalIngestBytes") is not None and iv else None,
+                    "note": "logicalDelta is net growth, not churn; physicalIngest is what reached the object store",
+                }
+            else:
+                entry["lastChangeRate"] = {"note": "only one snapshot - a second export is needed before a rate exists"}
+            entry["snapshots"] = snap_entries
+            pvcs.append(entry)
+
+        # maintenance: per repository, reported on every PVC as requested
+        runs = ((maint.get("schedule") or {}).get("runs") or {})
+        last_runs = []
+        for task, rl in runs.items():
+            if rl:
+                r = rl[-1]
+                last_runs.append({"task": task, "start": r.get("start"), "end": r.get("end"),
+                                  "success": r.get("success"), "error": r.get("error")})
+        last_runs.sort(key=lambda x: x.get("end") or "", reverse=True)
+        maint_summary = {
+            "owner": maint.get("owner"),
+            "quick": maint.get("quick"), "full": maint.get("full"),
+            "nextQuickMaintenance": (maint.get("schedule") or {}).get("nextQuickMaintenance"),
+            "nextFullMaintenance": (maint.get("schedule") or {}).get("nextFullMaintenance"),
+            "lastRun": last_runs[0] if last_runs else None,
+            "lastRunPerTask": last_runs,
+            "anyFailure": any(r.get("success") is False for r in last_runs),
+        }
+        for p in pvcs:
+            p["lastMaintenance"] = {"end": maint_summary["lastRun"]["end"] if maint_summary["lastRun"] else None,
+                                    "task": maint_summary["lastRun"]["task"] if maint_summary["lastRun"] else None,
+                                    "success": maint_summary["lastRun"]["success"] if maint_summary["lastRun"] else None,
+                                    "anyTaskFailed": maint_summary["anyFailure"]}
+
+        repo = t["repo"] or {}
+        storage = (rstatus or {}).get("storage") or {}
+        ns_results[(ns, prof)] = {
+            "repository": {"name": repo.get("RepositoryName"),
+                           "id": repo.get("RepositoryID"),
+                           "kopiaUniqueId": (rstatus or {}).get("uniqueIDHex"),
+                           "location": {"type": storage.get("type"),
+                                        "bucket": (storage.get("config") or {}).get("bucket"),
+                                        "prefix": (storage.get("config") or {}).get("prefix")},
+                           "format": {k: ((rstatus or {}).get("contentFormat") or {}).get(k) for k in ("version", "maxPackSize", "indexVersion")},
+                           "inventoried": bool(t["repo"]),
+                           "profile": prof, "totalSnapshots": repo.get("TotalSnapshots", len(snaps)),
+                           "orphanedCount": repo.get("OrphanedCount"), "danglingCount": repo.get("DanglingCount"),
+                           "maintenance": maint_summary,
+                           "objectCount": len(blobs),
+                           "objectBytes": sum(b.get("length", 0) for b in blobs),
+                           "packObjectCount": sum(1 for b in blobs if b.get("id", "")[:1] in ("p", "q")),
+                           "contentsRestampedAt": iso(dt.datetime.fromtimestamp(rewrite_ts, dt.timezone.utc)) if rewrite_ts else None,
+                           "contentBytesNotAttributableToASnapshot": (assigned.get("_unassigned") or {}).get("physical", 0) if contents else None,
+                           "contentCount": len(contents) if contents else None,
+                           "contentPhysicalBytes": sum(c["length"] for c in contents if not c.get("deleted")) if contents else None,
+                           "contentLogicalBytes": sum(c.get("originalLength", c["length"]) for c in contents if not c.get("deleted")) if contents else None},
+            "pvcs": pvcs,
+            "policies": t["policies"],
+            "_blobs": blobs, "_contents": contents, "_rewrite_ts": rewrite_ts,
+            "_snapshot_times": [epoch(parse_rfc3339(s["startTime"])) for s in snaps if parse_rfc3339(s["startTime"])],
+            # per snapshot: when, which PVC, how big the source was - the denominator of an
+            # export's change rate
+            "_snapshot_index": [{"t": epoch(parse_rfc3339(se["startTime"])), "pvc": p["name"],
+                                 "logicalBytes": se.get("totalSizeBytes") or 0}
+                                for p in pvcs for se in p["snapshots"] if parse_rfc3339(se["startTime"])],
+        }
+        rc.cleanup()
+
+
+
+def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
+              export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir, nodes_info=None):
+    # ---- export actions -----------------------------------------------------------------
+    # One policy run (label runActionName) produces a metadata export in the K10 namespace
+    # (isMetadataExport=true, no progress) and one export per application in that
+    # application's namespace. Only the latter has bytes: status.progressDetails and the
+    # per-volume operations sit behind the /details subresource, not on the object itself.
+    in_scope_ns = {ns for (ns, _) in ns_results}
+    exports_by_policy, policy_runs, to_detail = {}, {}, []
+    for ea in export_actions:
+        md, lab = ea["metadata"], ea["metadata"].get("labels") or {}
+        pol = lab.get("k10.kasten.io/policyName")
+        st, en = ea.get("status", {}).get("startTime"), ea.get("status", {}).get("endTime")
+        s_, e_ = parse_rfc3339(st), parse_rfc3339(en)
+        e = {"name": md["name"], "namespace": md["namespace"], "policy": pol,
+             "runAction": lab.get("k10.kasten.io/runActionName"),
+             "profile": lab.get("k10.kasten.io/exportProfile") or ((ea.get("spec") or {}).get("profile") or {}).get("name"),
+             "state": ea.get("status", {}).get("state"), "startTime": st, "endTime": en,
+             "durationSeconds": round(epoch(e_) - epoch(s_), 1) if s_ and e_ else None,
+             "runNow": lab.get("k10.kasten.io/isRunNow") == "true"}
+        if lab.get("k10.kasten.io/isMetadataExport") == "true" or md["namespace"] == kube.k10ns:
+            policy_runs.setdefault(pol, []).append(e)
+            continue
+        exports_by_policy.setdefault(pol, []).append(e)
+        if md["namespace"] in in_scope_ns and not (args.policy and pol not in args.policy):
+            to_detail.append(e)
+    for runs in policy_runs.values():
+        runs.sort(key=lambda x: x.get("startTime") or "")
+
+    # newest N per namespace/policy, unless asked for all
+    to_detail.sort(key=lambda x: x.get("startTime") or "", reverse=True)
+    if args.export_details_max:
+        seen, kept = {}, []
+        for e in to_detail:
+            k = (e["namespace"], e["policy"])
+            if seen.get(k, 0) < args.export_details_max:
+                seen[k] = seen.get(k, 0) + 1
+                kept.append(e)
+        to_detail = kept
+    if not args.no_export_details and to_detail:
+        with Step(f"export details for {len(to_detail)} exports", indent=2) as stp:
+            got = 0
+            for e in to_detail:
+                r = kube.run("get", "--raw", f"/apis/actions.kio.kasten.io/v1alpha1/namespaces/{e['namespace']}"
+                             f"/exportactions/{e['name']}/details", check=False)
+                if r.returncode != 0 or not r.stdout.strip():
+                    e["detailsError"] = (r.stderr or "no output").strip()[:200]
+                    continue
+                try:
+                    d = json.loads(r.stdout)
+                except ValueError:
+                    e["detailsError"] = "details is not JSON"
+                    continue
+                got += 1
+                stt = d.get("status") or {}
+                e["k10Progress"] = stt.get("progressDetails")
+                vols = []
+                for ph in ((stt.get("actionDetails") or {}).get("phases") or []):
+                    for v in ph.get("volumeOperations") or []:
+                        vols.append({"pvc": v.get("pvcName"), "operation": v.get("operation"),
+                                     "dataFormat": v.get("dataFormat"), "exportDirective": v.get("exportDirective"),
+                                     "storageClass": v.get("storageClass"), "storageType": v.get("storageType"),
+                                     "snapshotId": v.get("snapshotId")})
+                e["volumes"] = vols
+                # what actually left the cluster for the object store, per K10 itself; unlike
+                # Kopia timestamps this survives maintenance
+                e["exportedBytes"] = (e["k10Progress"] or {}).get("transferredBytes")
+            stp.note = f"{got} with progress"
+    # datamover metrics per application export window
+    for pol, lst in exports_by_policy.items():
+        for e in lst:
+            s_, e_ = parse_rfc3339(e.get("startTime")), parse_rfc3339(e.get("endTime"))
+            if s_ and e_ and e["namespace"] in in_scope_ns and prom and prom.available and \
+                    not (prom.retention_seconds and time.time() - epoch(s_) > prom.retention_seconds):
+                e["datamover"] = datamover_metrics(prom, kube.k10ns, args.datamover_pod_regex, epoch(s_), epoch(e_))
+
+    # ---- assemble by policy -------------------------------------------------------------------
+    def profile_summary(name):
+        p = profiles.get(name)
+        if not p:
+            return {"name": name, "note": "profile not found on cluster"}
+        loc = p.get("spec", {}).get("locationSpec", {})
+        obj = loc.get("objectStore") or {}
+        return {"name": name, "type": loc.get("type"), "objectStoreType": obj.get("objectStoreType"),
+                "endpoint": obj.get("endpoint"), "bucket": obj.get("name"), "prefix": obj.get("path"),
+                "region": obj.get("region"), "fileStore": loc.get("fileStore")}
+
+    def aps_for_namespace(ns):
+        out = []
+        for b in bindings:
+            if b["metadata"]["namespace"] != ns:
+                continue
+            ref = (b.get("spec") or {}).get("actionPodSpecRef") or {}
+            spec = apspecs.get(ref.get("name"))
+            out.append({"binding": b["metadata"]["name"], "actionPodSpec": ref.get("name"),
+                        "spec": (spec or {}).get("spec")})
+        return out
+
+    def exports_for(res, ns, pol_name, prof):
+        """This namespace's ExportActions for the policy (and profile), enriched with what the
+        export wrote according to K10 (/details) and to the Kopia repository."""
+        out = []
+        for e in exports_by_policy.get(pol_name, []):
+            if e["namespace"] != ns or (e.get("profile") and e["profile"] != prof):
+                continue
+            s_, e_ = parse_rfc3339(e.get("startTime")), parse_rfc3339(e.get("endTime"))
+            ex = dict(e)
+            if s_ and e_:
+                lo, hi = epoch(s_) - 5, epoch(e_) + 5
+                in_win = [x for x in res["_snapshot_index"] if lo <= x["t"] <= hi]
+                src_bytes = sum(x["logicalBytes"] for x in in_win)
+                ex["source"] = {"pvcs": sorted({x["pvc"] for x in in_win}), "logicalBytes": src_bytes,
+                                "note": "logical size of every PVC snapshot taken by this export, from Kopia"}
+                if res["_rewrite_ts"] and epoch(e_) < res["_rewrite_ts"]:
+                    ex["written"] = {"note": "unrecoverable: repository contents re-stamped by maintenance since this export"}
+                else:
+                    is_pack = lambda b: b.get("id", "")[:1] in ("p", "q")
+                    objs, obytes = written_in_window(res["_blobs"], "timestamp", lo, hi, is_pack)
+                    cn, cb = written_in_window([c for c in res["_contents"] if not c.get("deleted")], "time", lo, hi)
+                    ex["written"] = {"packObjects": objs, "packBytes": obytes, "contents": cn, "contentPhysicalBytes": cb,
+                                     "note": "pack objects and bytes that reached the object store during this export, from Kopia timestamps"}
+                # "change rate": bytes that left for the object store over the logical size of what
+                # was exported. 1.0 = a first export with nothing deduplicated or compressed; dedup
+                # against earlier snapshots and compression pull it down, encryption adds a little.
+                # Numerator: K10's own transferredBytes when /details gave it, else Kopia's pack bytes.
+                num, basis = ex.get("exportedBytes"), "k10 transferredBytes"
+                if num is None and "packBytes" in (ex.get("written") or {}):
+                    num, basis = ex["written"]["packBytes"], "kopia pack bytes written in the window"
+                if num is not None and src_bytes:
+                    ex["changeRate"], ex["changeRateBasis"] = round(num / src_bytes, 4), basis
+                else:
+                    ex["changeRate"] = None
+                cap = (ex.get("k10Progress") or {}).get("totalBytes")
+                if num is not None and cap:
+                    ex["transferredOverCapacity"] = round(num / cap, 4)
+            out.append(ex)
+        out.sort(key=lambda x: x.get("startTime") or "")
+        return out
+
+    pol_out = {}
+    for (ns, prof), res in ns_results.items():
+        for pol_name in sorted(res["policies"]):
+            pol = policies.get(pol_name)
+            if pol_name not in pol_out:
+                spec = (pol or {}).get("spec", {})
+                exp = next((a for a in spec.get("actions", []) if a.get("action") == "export"), {})
+                ep = exp.get("exportParameters", {})
+                pol_out[pol_name] = {
+                    "name": pol_name,
+                    "existsOnCluster": pol is not None,
+                    "profile": profile_summary(ep.get("profile", {}).get("name") or prof),
+                    "frequency": spec.get("frequency"),
+                    "subFrequency": spec.get("subFrequency"),
+                    "exportFrequency": ep.get("frequency"),
+                    "exportDataEnabled": (ep.get("exportData") or {}).get("enabled"),
+                    "retention": spec.get("retention"),
+                    "paused": spec.get("paused", False),
+                    "validation": (pol or {}).get("status", {}).get("validation"),
+                    "selectorKind": POLICY_KIND.get(pol_name, "namespace"),
+                    "selector": spec.get("selector"),
+                    "runs": policy_runs.get(pol_name, []),
+                    "namespaces": [],
+                }
+            pol_out[pol_name]["namespaces"].append({
+                "name": ns,
+                "actionPodSpecs": aps_for_namespace(ns),
+                "repository": res["repository"],
+                "exports": exports_for(res, ns, pol_name, prof),
+                "pvcCount": len(res["pvcs"]),
+                "totalSizeBytes": sum(p.get("totalSizeBytes") or 0 for p in res["pvcs"]),
+                "totalFileCount": sum(p.get("fileCount") or 0 for p in res["pvcs"]),
+                "pvcs": res["pvcs"],
+            })
+
+    pod_labels_exposed = ksm_pod_labels_exposed(prom, kube.k10ns) if (prom and prom.available) else None
+    topo = {
+        "generatedAt": iso(dt.datetime.now(dt.timezone.utc)),
+        "cluster": {"context": ctx, "uid": uid, "k10Version": ver, "k10Namespace": kube.k10ns},
+        "metrics": None if not prom else {
+            "url": prom.url, "flavour": prom.flavour, "available": prom.available,
+            "retentionSeconds": prom.retention_seconds,
+            "datamoverPodRegex": args.datamover_pod_regex,
+            "podLabelsExposed": pod_labels_exposed,
+            "attribution": ("namespace and job via kube_pod_labels (KSM metric-labels-allowlist); not per PVC - "
+                            "copy-vol-data pods mount an ephemeral clone, not the source PVC"
+                            if pod_labels_exposed else
+                            "NOT POSSIBLE: kube-state-metrics exposes no pod labels for the K10 namespace, so datamover "
+                            "usage is per pod only. Add --metric-labels-allowlist=pods=[app-name,policy-name,k10.kasten.io/jobID] "
+                            "to kube-state-metrics" if pod_labels_exposed is False else
+                            "unknown: kube_pod_labels could not be queried"),
+            "caveat": "pods living under one kubelet scrape interval (30s) leave no usable sample and are listed "
+                      "in podsWithoutSamples; peak figures are a floor for short exports",
+        },
+        "nodes": nodes_info,
+        "helmLimiters": limiters,
+        "features": features,
+        "actionPodSpecs": [{"name": n, "spec": s.get("spec")} for n, s in sorted(apspecs.items())],
+        "policies": sorted(pol_out.values(), key=lambda p: p["name"]),
+        "orphanedRepositories": orphan_repos,
+        "filter": ({"namespaces": args.namespace, "policies": args.policy} if (args.namespace or args.policy) else None),
+        "notExported": not_exported,
+        "scopeNotes": {"namespacesWithoutRestorePointSkipped": skipped_no_rp,
+                       "k10NamespaceSkipped": "its export is the disaster-recovery repository, a different repository kind"},
+        "repositoriesWithoutVolumeData": [
+            {"name": r.get("RepositoryName"), "type": r.get("Type"), "profile": r.get("ProfileName"),
+             "totalSnapshots": r.get("TotalSnapshots")} for r in inv.get("repositories", []) if r.get("Type") != "Data"],
+        "warnings": WARNINGS,
+    }
+    shutil.rmtree(workdir, ignore_errors=True)
+    return topo
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--context", help="kube context (default: current)")
+    ap.add_argument("--k10-namespace", default="kasten-io")
+    ap.add_argument("-o", "--output", default="export-topology.json")
+    ap.add_argument("--namespace", action="append", help="restrict to these application namespaces (repeatable)")
+    ap.add_argument("--policy", action="append", help="restrict to these policies (repeatable); with --namespace, one pair")
+    ap.add_argument("--repo-checker", help="path to k10_repo_checker.sh (default: download for the cluster's K10 version)")
+    ap.add_argument("--keep-pods", action="store_true", help="leave debug-kopia pods behind")
+    ap.add_argument("--no-metrics", action="store_true", help="skip cAdvisor / kube-state-metrics")
+    ap.add_argument("--prom-url", help="non-OpenShift Prometheus base URL")
+    ap.add_argument("--prom-token", help="bearer token for --prom-url")
+    ap.add_argument("--prom-header", help="extra header for --prom-url, e.g. 'X-Scope-OrgID: tenant'")
+    ap.add_argument("--prom-namespace", default="openshift-monitoring")
+    ap.add_argument("--datamover-pod-regex", default=DATAMOVER_POD_REGEX)
+    ap.add_argument("--no-histogram", action="store_true", help="skip the file-size histogram (a full tree listing per PVC)")
+    ap.add_argument("--histogram-max-files", type=int, default=2_000_000, help="skip the histogram above this many files")
+    ap.add_argument("--no-content-list", action="store_true", help="skip kopia content list (no physical ingest figures)")
+    ap.add_argument("--no-inventory", action="store_true", help="skip repo_checker inventory; discover from export policies only")
+    ap.add_argument("--no-export-details", action="store_true", help="skip the ExportAction /details fetch (no K10 byte counters)")
+    ap.add_argument("--export-details-max", type=int, default=20, help="newest exports per namespace/policy to fetch details for (0 = all)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="echo every repo_checker / k10tools progress line")
+    args = ap.parse_args()
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    for tool in ("kubectl", "helm"):
+        if not shutil.which(tool):
+            raise SystemExit(f"{tool} not found in PATH ({'repo_checker requires helm' if tool == 'helm' else 'required'})")
+
+    topo = collect(args)
+    with open(args.output, "w") as f:
+        json.dump(topo, f, indent=2, default=str)
+    npol = len(topo["policies"])
+    nns = sum(len(p["namespaces"]) for p in topo["policies"])
+    npvc = sum(len(n["pvcs"]) for p in topo["policies"] for n in p["namespaces"])
+    log(f"wrote {args.output}: {npol} policies, {nns} namespaces, {npvc} PVCs, {len(WARNINGS)} warnings")
+
+
+if __name__ == "__main__":
+    main()
