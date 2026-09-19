@@ -57,6 +57,17 @@ def fmt_ts(s):
     return s[:19].replace("T", " ") + "Z"
 
 
+def ts_seconds(s):
+    """Epoch seconds from an ISO-8601 string (the generator writes '...Z', possibly with
+    fractional seconds); None when absent or unparsable."""
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def signed_bytes(n):
     if n is None:
         return "–"
@@ -228,7 +239,8 @@ def dm_cell(dm):
     pods = ", ".join(f'{p["pod"]}→{p.get("appNamespace") or "?"}' for p in dm.get("pods") or [])
     nos = dm.get("podsWithoutSamples") or []
     avg = dm.get("avgCpuCores")
-    win = (dm.get("windowEnd") or 0) - (dm.get("windowStart") or 0)
+    ws, we = ts_seconds(dm.get("windowStart")), ts_seconds(dm.get("windowEnd"))
+    win = (we - ws) if (ws is not None and we is not None) else 0
     tip = (f"memory: peak of the sum over all datamover pods alive in the window. "
            f"CPU: {cpu if cpu is not None else '–'} CPU-seconds consumed by those pods in total"
            + (f" over {fmt_dur(win)}, i.e. {avg:.2f} cores on average" if avg is not None and win else "")
