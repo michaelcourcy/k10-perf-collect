@@ -1338,15 +1338,45 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
             log(f"  {ns}: contents re-stamped by maintenance at {iso(dt.datetime.fromtimestamp(rewrite_ts, dt.timezone.utc))}; "
                 f"physical ingest of earlier snapshots is unrecoverable")
         ns_pvc_names = set(pvc_by_ns.get(ns, {}).keys())
-        by_source = {}
+        # Kopia writes an incomplete manifest every 45 min while a long upload runs
+        # (incomplete: "checkpoint", same startTime as the running snapshot). Not restore
+        # points: keep them apart and report them as the export's live progress.
+        by_source, checkpoints = {}, {}
         for s in snaps:
-            by_source.setdefault(s["source"]["host"], []).append(s)
+            if s.get("incomplete"):
+                checkpoints.setdefault(s["source"]["host"], []).append(s)
+            else:
+                by_source.setdefault(s["source"]["host"], []).append(s)
+        for host in checkpoints:
+            by_source.setdefault(host, [])  # a first export still running: PVC with no complete snapshot yet
 
         pvcs = []
         for j, (host, slist) in enumerate(sorted(by_source.items()), 1):
             slist.sort(key=lambda x: x["startTime"])
             pvc_name, workload, how = resolve_pvc(host, ns_pvc_names)
-            log(f"    pvc {j}/{len(by_source)} {pvc_name}: {len(slist)} snapshots ({snapshot_mode(slist[-1])} mode)")
+            cps = sorted(checkpoints.get(host, []), key=lambda x: x["endTime"] or "")
+            in_progress = None
+            if cps:
+                last_cp = cps[-1]
+                cp_size, cp_files = snapshot_size_files(last_cp)
+                st_, en_ = parse_rfc3339(last_cp["startTime"]), parse_rfc3339(last_cp["endTime"])
+                elapsed = (epoch(en_) - epoch(st_)) if st_ and en_ else None
+                in_progress = {"startTime": last_cp["startTime"], "checkpoints": len(cps),
+                               "lastCheckpointTime": last_cp["endTime"], "filesSoFar": cp_files, "bytesSoFar": cp_size,
+                               "elapsedSeconds": round(elapsed, 1) if elapsed else None,
+                               "filesPerSecond": round(cp_files / elapsed, 1) if elapsed and cp_files else None,
+                               "bytesPerSecond": round(cp_size / elapsed) if elapsed and cp_size else None,
+                               "note": "Kopia checkpoints of a snapshot still being uploaded (one every 45 min); not restore points"}
+            if not slist:
+                log(f"    pvc {j}/{len(by_source)} {pvc_name}: no complete snapshot yet, export in progress "
+                    f"({in_progress['checkpoints']} checkpoints, {in_progress['filesSoFar']} files so far)")
+                pvcs.append({"name": pvc_name, "workload": workload, "resolvedBy": how, "sourceHost": host,
+                             "existsOnCluster": pvc_name in ns_pvc_names, "snapshotCount": 0, "snapshots": [],
+                             "mode": snapshot_mode(cps[-1]), "fileCount": None, "totalSizeBytes": None,
+                             "sizeHistogram": None, "inProgress": in_progress})
+                continue
+            log(f"    pvc {j}/{len(by_source)} {pvc_name}: {len(slist)} snapshots ({snapshot_mode(slist[-1])} mode)"
+                + (f", export in progress ({in_progress['checkpoints']} checkpoints)" if in_progress else ""))
             live = pvc_by_ns.get(ns, {}).get(pvc_name)
             entry = {
                 "name": pvc_name,
@@ -1421,6 +1451,8 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
             entry["mode"] = mode
             entry["dirCount"] = lstats.get("dirCount")
             entry["lastSnapshotTime"] = last["startTime"]
+            if in_progress:
+                entry["inProgress"] = in_progress
             entry["snapshotCount"] = len(slist)
 
             if mode == "block":

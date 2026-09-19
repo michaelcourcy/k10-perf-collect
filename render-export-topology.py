@@ -286,6 +286,22 @@ def snapshots_table(snaps):
                  rows, num_cols=(2, 3, 4, 5, 6))
 
 
+def in_progress_block(ip):
+    """A snapshot still being uploaded, seen through Kopia's 45-minute checkpoints."""
+    if not ip:
+        return ""
+    rate = ""
+    if ip.get("filesPerSecond"):
+        rate = f' · ≈ {ip["filesPerSecond"]:.0f} files/s'
+    elif ip.get("bytesPerSecond"):
+        rate = f' · ≈ {fmt_bytes(ip["bytesPerSecond"])}/s'
+    return (f'<div class="note" style="border-left:3px solid var(--warning);padding-left:8px">'
+            f'<b>Export in progress</b> since {esc(fmt_ts(ip.get("startTime")))}: {fmt_num(ip.get("filesSoFar"))} files · '
+            f'{fmt_bytes(ip.get("bytesSoFar"))} uploaded at the last checkpoint ({esc(fmt_ts(ip.get("lastCheckpointTime")))}, '
+            f'checkpoint {ip.get("checkpoints")}{rate}). Kopia checkpoints are written every 45 min so an interrupted upload '
+            f'can resume; they are not restore points and are excluded from the counts.</div>')
+
+
 def pvc_row(p):
     cr = p.get("lastChangeRate") or {}
     if cr.get("logicalDeltaBytes") is not None:
@@ -322,7 +338,8 @@ def pvc_row(p):
     detail = (
         f'<div class="detail"><div class="two">'
         f'<div>{histogram_figure(p.get("sizeHistogram"), p["name"])}</div>'
-        f'<div><figcaption>Snapshots ({fmt_num(p.get("snapshotCount"))})</figcaption>{snapshots_table(p.get("snapshots") or [])}</div>'
+        f'<div><figcaption>Snapshots ({fmt_num(p.get("snapshotCount"))})</figcaption>{in_progress_block(p.get("inProgress"))}'
+        f'{snapshots_table(p.get("snapshots") or []) if p.get("snapshots") else ""}</div>'
         f'</div>'
         + "".join(f'<div class="note">{esc(n)}</div>' for n in notes)
         + (f'<div class="note">Change rate: {esc(cr.get("note"))}</div>' if cr.get("note") else "")

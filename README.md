@@ -118,7 +118,15 @@ plus any `*Pressure` condition. Usage comes from the kubelet stats summary
 back to the metrics API (`metrics.k8s.io`, CPU and memory only). It is one sample, not
 an average: run the generator while exports are in flight to see what they cost.
 
-Four properties of the data worth knowing before reading the JSON:
+Five properties of the data worth knowing before reading the JSON:
+
+- **Checkpoints are not snapshots.** While an export runs, Kopia writes an *incomplete*
+  manifest every 45 minutes (its checkpoint interval) so an interrupted upload can
+  resume; `kopia snapshot list --all` returns them with the same `startTime` as the
+  running snapshot and `incomplete: "checkpoint"`. The generator excludes them from the
+  PVC's snapshot list and counts and reports them under the PVC's `inProgress`
+  (start, checkpoints so far, files and bytes uploaded at the last checkpoint) — live
+  progress of the export from the repository's side.
 
 - **File counts come from the snapshot tree** (`rootEntry.summ.files` / `summ.fileSize`).
   Kopia's `stats.fileCount` is the number of files it *hashed* in that run, exposed per
