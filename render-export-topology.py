@@ -282,8 +282,12 @@ def snapshots_table(snaps):
             phys_cell = f'<span title="{esc(s.get("physicalIngestNote"))}">~{fmt_bytes(phys)}</span>'
         else:
             phys_cell = fmt_bytes(phys)
+        ea = s.get("exportAction")
+        start_cell = (f'<span title="ExportAction {esc(ea)}">{esc(fmt_ts(s.get("startTime")))}</span>' if ea else
+                      f'<span title="{esc(s.get("exportActionNote") or "")}">{esc(fmt_ts(s.get("startTime")))}'
+                      f'{" <span class=muted>· no action</span>" if "exportAction" in s else ""}</span>')
         rows.append([
-            esc(fmt_ts(s.get("startTime"))),
+            start_cell,
             esc(fmt_dur(s.get("durationSeconds"))),
             files_cell,
             hashed_cell,

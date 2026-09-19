@@ -118,7 +118,13 @@ plus any `*Pressure` condition. Usage comes from the kubelet stats summary
 back to the metrics API (`metrics.k8s.io`, CPU and memory only). It is one sample, not
 an average: run the generator while exports are in flight to see what they cost.
 
-Five properties of the data worth knowing before reading the JSON:
+Six properties of the data worth knowing before reading the JSON:
+
+- **Every snapshot names its ExportAction** (`snapshots[].exportAction`, matched by time
+  window); one without is flagged with `exportActionNote` — another policy or a run-now
+  action exporting into the same repository, or retired action history. ExportActions
+  are listed after the repositories are read, so an export that starts during a long run
+  is not missing while its snapshot is present.
 
 - **Checkpoints are not snapshots.** While an export runs, Kopia writes an *incomplete*
   manifest every 45 minutes (its checkpoint interval) so an interrupted upload can

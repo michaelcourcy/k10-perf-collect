@@ -1199,16 +1199,17 @@ def collect(args):
     features = (kube.get("cm", "k10-features", ns=kube.k10ns) or {}).get("data", {})
 
     # ---- K10 objects --------------------------------------------------------------------
-    log("reading policies, profiles, export actions and PVCs ...")
+    log("reading policies, profiles and PVCs ...")
     policies = {p["metadata"]["name"]: p for p in (kube.get("policies.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
     profiles = {p["metadata"]["name"]: p for p in (kube.get("profiles.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
     apspecs = {p["metadata"]["name"]: p for p in (kube.get("actionpodspecs.config.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]}
     bindings = (kube.get("actionpodspecbindings.config.kio.kasten.io", all_ns=True) or {"items": []})["items"]
     # per-application exports live in the application namespace; the K10 namespace only
     # holds the policy run's metadata export
-    export_actions = (kube.get("exportactions.actions.kio.kasten.io", all_ns=True) or {"items": []})["items"]
+    export_actions = []  # listed after the repository reads (see below): an action that starts
+    #                      during the run must not be missing while its snapshot is present
     all_pvcs = (kube.get("pvc", all_ns=True) or {"items": []})["items"]
-    log(f"  {len(policies)} policies, {len(profiles)} profiles, {len(export_actions)} export actions, {len(all_pvcs)} PVCs")
+    log(f"  {len(policies)} policies, {len(profiles)} profiles, {len(all_pvcs)} PVCs")
     with Step("node capacity and usage", indent=2) as stp:
         nodes_info = collect_nodes(kube)
         stp.note = f"{nodes_info['totals']['nodes']} nodes via {', '.join(nodes_info['usageSources']) or 'no usage source'}"
@@ -1316,6 +1317,11 @@ def collect(args):
         _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported)
     finally:
         rc.cleanup(wait=True)
+    # ExportActions are listed only now: the repositories were read over the last minutes
+    # and an export that started meanwhile has its Kopia snapshot in them - listing the
+    # actions first left such a snapshot without its action (seen: 4 snapshots, 3 actions).
+    export_actions = (kube.get("exportactions.actions.kio.kasten.io", all_ns=True) or {"items": []})["items"]
+    log(f"  {len(export_actions)} export actions (listed after the repositories)")
 
     return _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
                      export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir, nodes_info)
@@ -1760,11 +1766,28 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                     "runs": policy_runs.get(pol_name, []),
                     "namespaces": [],
                 }
+            ns_exports = exports_for(res, ns, pol_name, prof)
+            # every snapshot gets the ExportAction that produced it (window match); one
+            # without is flagged instead of being left for the reader to guess about
+            all_ns_exports = [e for e in exports_by_policy.get(pol_name, []) if e["namespace"] == ns]
+            for pv in res["pvcs"]:
+                for se in pv.get("snapshots") or []:
+                    t = epoch(parse_rfc3339(se["startTime"])) if parse_rfc3339(se["startTime"]) else None
+                    hit = None
+                    for e in all_ns_exports:
+                        s_, e_ = parse_rfc3339(e.get("startTime")), parse_rfc3339(e.get("endTime") or e.get("startTime"))
+                        if t is not None and s_ and e_ and epoch(s_) - 5 <= t <= epoch(e_) + 5:
+                            hit = e["name"]
+                            break
+                    se["exportAction"] = hit
+                    if hit is None:
+                        se["exportActionNote"] = ("no ExportAction of this policy covers this time: written by another policy "
+                                                  "or a run-now action into the same repository, or the action history was retired")
             pol_out[pol_name]["namespaces"].append({
                 "name": ns,
                 "actionPodSpecs": aps_for_namespace(ns),
                 "repository": res["repository"],
-                "exports": exports_for(res, ns, pol_name, prof),
+                "exports": ns_exports,
                 "pvcCount": len(res["pvcs"]),
                 "totalSizeBytes": sum(p.get("totalSizeBytes") or 0 for p in res["pvcs"]),
                 "totalFileCount": sum(p.get("fileCount") or 0 for p in res["pvcs"]),
