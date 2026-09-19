@@ -136,10 +136,28 @@ Four properties of the data worth knowing before reading the JSON:
   ```
 
   `peakSumMemoryBytes` is the maximum, over the window, of memory summed across those
-  pods at each step; `cpuSecondsTotal` is per pod `max − min` of the cumulative counter
-  (no `rate()`, so short-lived pods are not smoothed away), summed — **CPU-seconds**, the
-  total CPU time the datamovers consumed; `avgCpuCores` divides it by the window length
-  (716 cpu-s over 14.5 min ≈ 0.82 cores on average), which is what the HTML shows first. Any datamover alive
+  pods at each step.
+
+  **CPU is reported in CPU-seconds (`cpu-s`)**: the total CPU time all datamover pods in
+  the window consumed — a pod burning 2 cores for 30 s is 60 cpu-s. It comes from the
+  cumulative counter `container_cpu_usage_seconds_total`, per pod `max − min` between the
+  first and last sample inside the window, summed over pods (`cpuSecondsTotal`). This is
+  the one CPU figure the data supports: a `rate()` would need several samples per pod,
+  and datamovers live seconds to minutes with a 15–30 s scrape interval, so a rate
+  smooths a short pod towards zero or misses it entirely; the counter difference keeps
+  every second that was sampled. The HTML shows the average core count first, derived as
+
+  ```
+  avgCpuCores   = cpuSecondsTotal / windowSeconds
+  windowSeconds = (endTime + 45 s) − (startTime − 45 s) = export duration + 90 s
+  ```
+
+  e.g. `0.44 cores avg (1136 cpu-s)` ⇔ a 43 min window (a 41.5 min export plus the 90 s
+  of padding). The padding exists because a pod's first or last sample often falls just
+  outside the action's own timestamps; it slightly dilutes the average (3.5 % here, much
+  more for a 30 s export), which is why `cpu-s` stays visible. Both figures are a floor
+  for short exports: a pod alive for less than one scrape interval leaves no sample at
+  all and is listed under `podsWithoutSamples`. Any datamover alive
   in the window is counted — two policies exporting in the same minute see the same
   pods, and the disks of one VM export concurrently, so their PVC rows show the same
   figures. Pods that lived less than one scrape interval are listed in
