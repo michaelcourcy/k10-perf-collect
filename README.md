@@ -64,7 +64,7 @@ repository on that profile is listed under `notExported`.
 Focusing on one export problem: `--namespace NS --policy POLICY` (both repeatable)
 collects a single namespace/policy pair in minutes instead of reading every repository,
 and the JSON records the filter. Without re-collecting, the renderer cuts a full report
-down the same way: `python3 render-export-topology.py topo.json --policy P --namespace NS -o focus.html`
+down the same way: `python3 render-export-topology.py topo.json --policy POLICY --namespace NS -o focus.html`
 (a banner says what was hidden).
 
 Useful flags: `--namespace NS` (repeatable) to restrict; `--no-inventory` to skip
