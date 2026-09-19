@@ -573,6 +573,15 @@ class ConnectError(RuntimeError):
     """repo_checker -o connect reported a failure (cause chain in the message)."""
 
 
+class ImagePullError(SystemExit):
+    """A pod repo_checker or k10tools created cannot pull its image. Fatal for the whole run:
+    every later call would fail the same way, and repo_checker itself would wait forever
+    ("Waiting for K10 tools pod to be Running" is a `while true`)."""
+
+
+PULL_FAILURE_REASONS = {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ImageInspectError", "ErrImageNeverPull"}
+
+
 def k10_image_registry(k10cfg):
     """Registry/prefix K10 itself pulls from, e.g. 'registry.connect.redhat.com/kasten' from
     KanisterToolsImage=registry.connect.redhat.com/kasten/kanister-tools@sha256:... - the
@@ -607,6 +616,38 @@ class RepoChecker:
             raise SystemExit(f"cannot download repo_checker for K10 {version}: {e}. Use --repo-checker PATH.")
         os.chmod(dst, 0o755)
         return dst
+
+    def _pull_failure(self):
+        """(pod, image, reason, message) for the first k10tools-*/debug-kopia-* pod stuck on an
+        image pull in the K10 namespace, else None."""
+        pods = self.kube.get("pods", ns=self.kube.k10ns) or {"items": []}
+        for p in pods.get("items", []):
+            name = p["metadata"]["name"]
+            if not (name.startswith("k10tools-") or name.startswith("debug-kopia-")):
+                continue
+            for cs in (p.get("status") or {}).get("containerStatuses") or []:
+                w = (cs.get("state") or {}).get("waiting") or {}
+                if w.get("reason") in PULL_FAILURE_REASONS:
+                    return name, cs.get("image"), w["reason"], (w.get("message") or "").strip()
+        return None
+
+    def _abort_on_pull_failure(self, proc, hit):
+        pod, image, reason, message = hit
+        proc.kill()
+        # wait: the message below promises the pod is gone, and a user checks right away
+        self.kube.run("-n", self.kube.k10ns, "delete", "pod", pod, "--grace-period=1", "--wait=true", "--timeout=60s", check=False)
+        which = "k10tools" if pod.startswith("k10tools-") else "datamover (debug-kopia)"
+        detected = getattr(self, "detected_registry", None)
+        hint = (f" K10 itself pulls from {detected}: try --image-registry auto." if detected and detected != (self.image_registry or "gcr.io/kasten-images")
+                else "")
+        raise ImagePullError(
+            f"\nAUDIT ABORTED: the {which} pod {pod} in {self.kube.k10ns} cannot pull its image\n"
+            f"  image : {image}\n  reason: {reason}" + (f" - {message[:300]}" if message else "") + "\n"
+            f"  fix   : make k10tools, datamover and kanister-tools at tag {self.image_tag} pullable from this cluster "
+            f"(mirror them into a registry it can reach, with the pull secret K10 uses), then re-run with "
+            f"--image-registry <registry/prefix>.{hint}"
+            f" If docs.kasten.io is unreachable too, download k10_repo_checker.sh elsewhere and pass --repo-checker PATH.\n"
+            f"  the pod was deleted; no other resource was created.")
 
     def _run(self, *args, timeout=1800):
         env = dict(os.environ)
@@ -646,11 +687,17 @@ class RepoChecker:
         th = threading.Thread(target=reader, daemon=True)
         th.start()
         t0 = time.monotonic()
+        last_pull_check = t0
         while th.is_alive():
             th.join(1.0)
             if time.monotonic() - t0 > timeout:
                 proc.kill()
                 raise RuntimeError(f"repo_checker {' '.join(args)} exceeded {timeout}s")
+            if time.monotonic() - last_pull_check >= 10:
+                last_pull_check = time.monotonic()
+                hit = self._pull_failure()
+                if hit:
+                    self._abort_on_pull_failure(proc, hit)
             if not VERBOSE and time.monotonic() - last["printed"] >= 30:
                 last["printed"] = time.monotonic()
                 log(f"    repo_checker running for {int(time.monotonic() - t0)}s - last: {last['line'][:120] or '(no output yet)'}")
@@ -1147,6 +1194,7 @@ def collect(args):
     detected = k10_image_registry(k10cfg)
     registry = detected if args.image_registry == "auto" else args.image_registry
     rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
+    rc.detected_registry = detected
     log(f"repo_checker images: {registry or 'gcr.io/kasten-images'}/k10tools:{args.image_tag or ver}"
         + (f"  (K10 itself pulls from {detected}; pass --image-registry auto if gcr.io is unreachable)"
            if detected and not registry and detected != "gcr.io/kasten-images" else ""))
@@ -1195,6 +1243,8 @@ def collect(args):
             focused = bool(args.namespace or args.policy)
             inv_profiles = sorted({prof for (_, prof) in targets} & set(profiles)) if focused else sorted(profiles)
             inv, orphan_repos = rc.inventory(inv_profiles, full=not focused)
+        except ImagePullError:
+            raise
         except SystemExit as e:
             warn(f"inventory unavailable: {e}; continuing from the export policies alone")
         if orphan_repos:

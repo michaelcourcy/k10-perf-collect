@@ -86,9 +86,14 @@ the cluster. The generator always pins the tag to the cluster's K10 version
 ```
 
 `auto` reads the registry from K10's own image references (`KanisterToolsImage` in
-`k10-config`), e.g. `registry.connect.redhat.com/kasten`; give an explicit prefix
-instead if your mirror lives elsewhere. The generator logs the image it will use
-(`repo_checker images: …`) before the first repo_checker call.
+`k10-config`), e.g. `registry.connect.redhat.com/kasten` for an operator install —
+verified to serve `k10tools:<version>` as a tag; give an explicit prefix instead if your
+mirror lives elsewhere. The generator logs the image it will use (`repo_checker images:
+…`) before the first repo_checker call. If a `k10tools-*` or `debug-kopia-*` pod cannot
+pull its image (`ErrImagePull`, `ImagePullBackOff`, `InvalidImageName`), the run stops
+within about 10 s with `AUDIT ABORTED`, the image, the kubelet's reason and the fix
+(mirror the three images, `--image-registry`, `--repo-checker`), and deletes the stuck
+pod — repo_checker on its own would wait forever.
 
 A full run takes minutes to an hour (the `repo_checker` inventory re-scans the whole
 catalog, and every filesystem PVC gets a full tree listing). Progress goes to stderr
