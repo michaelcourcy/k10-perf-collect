@@ -150,8 +150,12 @@ Six properties of the data worth knowing before reading the JSON:
   by Kopia timestamps vs 56 MB by K10 for the same export. Denominator:
   the logical size of the PVC snapshots that export took (`source.logicalBytes`). 100%
   means a first export with nothing deduplicated or compressed; dedup against earlier
-  snapshots and compression pull it down, encryption adds a little. It is the best
-  single figure available, not a measured change rate. Per-application ExportActions
+  snapshots and compression pull it down, encryption adds a little. It can exceed 100 %
+  on incompressible small files: `transferredBytes` includes Kopia's directory entries
+  and per-block encryption overhead, a few percent of 10 kB files (105 % observed on a
+  5 M-file volume of random data). It is the best single figure available, not a
+  measured change rate — and when it looks wrong, check the workload before the tool:
+  a pod that crash-loops and regenerates its data shows ~100 % on every export. Per-application ExportActions
   live in the **application namespace**; the ones in the K10 namespace are the policy
   run's metadata export and appear as `policies[].runs`. Details are fetched for the 20
   newest exports per namespace/policy (`--export-details-max`, 0 = all;
