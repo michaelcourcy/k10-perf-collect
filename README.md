@@ -229,6 +229,15 @@ Six properties of the data worth knowing before reading the JSON:
   `metrics.podLabelsExposed` is `true`/`false`, and when false `metrics.attribution`
   says so and usage is reported per pod only.
 
+## Example
+
+[`examples/audit-example.md`](examples/audit-example.md) is a worked audit on the reference
+cluster: what the report showed about five namespaces after 36 hours of exports (file-count-
+bound throughput, measured change rates checked against synthetic workloads of known churn,
+dedup ratios of real vs random data, datamover memory per million files, node state) and the
+storage and Kasten recommendations that follow. The full anonymised report it is drawn from is
+[`examples/export-topology-2026-09-20-09_44.html`](examples/export-topology-2026-09-20-09_44.html).
+
 ## Other scripts
 
 Two standalone helpers at the repository root complement the generator. Both are bash
