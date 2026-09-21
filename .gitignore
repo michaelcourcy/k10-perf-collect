@@ -18,3 +18,6 @@ k10_repo_checker.sh
 # python bytecode from the generator
 __pycache__/
 *.pyc
+
+# test on my own machine
+tests/
