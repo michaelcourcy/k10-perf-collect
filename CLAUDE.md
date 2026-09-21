@@ -10,6 +10,16 @@ setup inline. `lib/init.sh` is the only thing a reader sources. When adding a he
 put it in `lib/` and reference it from the guide — do not paste a new function
 definition into a guide.
 
+| File | Provides |
+|---|---|
+| `focus.sh` | `audit_focus`, `audit_focus_candidates`, `focus_dir` — the pinned pair |
+| `policies.sh` | the scope rule: which namespaces an export policy selects |
+| `kopia.sh` | `kopia_exec`, `kopia_pvcs`, `kopia_snapshots`, `kopia_ingest`, `kopia_histogram`, `kopia_checkpoints` |
+| `exports.sh` | `export_actions`, `export_table`, `export_volumes`, `policy_runs` — the `/details` byte counters |
+| `datamover.sh` | `datamover_for_export`, `datamover_pods`, `ksm_pod_labels_check` |
+| `nodes.sh` | `node_snapshot`, `node_totals` |
+| `prometheus.sh` `window.sh` `portforward.sh` `provenance.sh` `check_auth.sh` `pvcscan.sh` | as before |
+
 Run after any change to `lib/`:
 
 ```bash
@@ -21,6 +31,16 @@ bash -c '. lib/init.sh' && zsh -c '. lib/init.sh'
 
 **Guides 00–13** are executed by the *customer's* platform team. They are procedures
 under time pressure, not reference material.
+
+**They are scoped to ONE (namespace, policy) pair.** Guide 00 §10 pins it with
+`audit_focus`; every guide reads `$AUDIT_NS`, `$AUDIT_POLICY`, `$AUDIT_PROFILE` and
+writes into `$AUDIT_DIR/<ns>.<policy>/<NN>-<name>/` via `focus_dir`. That pair is
+exactly `generate-export-topology.py --namespace NS --policy POLICY`, and the two are
+kept numerically identical on purpose — see "Guides and the generator" below. Do not
+reintroduce cluster-wide sweeps into the guides; that is the generator's job.
+
+Guide order has one hard constraint: **12 before 04, 05, 06 and 11**, because guide 12
+step 4 opens the read-only repository connection those four read from.
 
 Authorisation is not a separate document and is not staged: `lib/check_auth.sh` holds
 the complete list, `lib/init.sh` refuses to start without all of it, and
@@ -65,7 +85,7 @@ It classifies by severity. **HANG** (unbalanced quote — the paste appears to f
 contents are actually run) must be zero; the linter exits non-zero if not. **PARSE**
 (a `(`, `<`, `>`, `|` or `;do` in comment prose) is neutralised by
 `setopt interactive_comments` and is acceptable — purging every parenthesis from the
-prose is not worth it. Currently: HANG=0, EXEC=0, PARSE=8.
+prose is not worth it. Currently: HANG=0, EXEC=0, PARSE=1.
 
 ### 2. zsh does not word-split unquoted *parameter* expansion
 
@@ -120,6 +140,28 @@ generator: a VM's disks are PVCs in the VM's namespace and its export lands in t
 namespace's repository, so only the namespace is resolved from the selector and the
 Kopia read is the same. On a lab cluster 11 of 27 exporting policies are VM policies. The
 guides (shell) still flag them for manual resolution.
+
+## Guides and the generator
+
+`generate-export-topology.py` and guides 01–13 are two front ends on the same data.
+They must not drift. The guides take their figures from `lib/` helpers that read the
+**same fields** the generator reads, and were validated to produce identical numbers on
+the same pair (file counts, histogram buckets, per-snapshot physical ingest including
+the nearest-window attribution and 1 s padding, change rate).
+
+When either side learns something about a data source, change both. In particular:
+
+| Quantity | Correct field | The field that looks right and is not |
+|---|---|---|
+| PVC file count | `rootEntry.summ.files` | `stats.fileCount` — files **hashed** in that run; measured 0 on a 100,003-file volume |
+| PVC logical size | `rootEntry.summ.fileSize` | `stats.totalFileSize` — null in block mode |
+| Files changed | `stats.fileCount` / `stats.cachedFiles`, labelled hashed/unchanged | — |
+| Export bytes | `/details` subresource `status.progressDetails` | the ExportAction object — `progressDetails` and `actionDetails` are **null** there |
+| Export capacity | `progressDetails.totalBytes` is the **volume capacity** | not the data size; never a change-rate denominator |
+
+Validation pairs on the reference cluster: `prod-test` / `calibrate-backup` (100,003
+files of 512 KB, known 20 % rewrite per cycle — all three change-rate methods return
+0.20) and `large-test-block` / `calibrate-backup-block` (block mode).
 
 ## The generator
 

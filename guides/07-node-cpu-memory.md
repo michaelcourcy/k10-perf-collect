@@ -1,58 +1,62 @@
 # 07 — Node CPU and RAM capacity
 
-## What Global Engineering needs
+## What auditors need
 
 Per node: CPU and memory capacity, allocatable, how much is already requested by
 existing workloads, and what the real peak utilisation is. Datamover pods are scheduled
 onto these nodes during the backup window, so the figure that matters is not capacity —
 it is **headroom at the time the backup runs**.
 
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
-
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/07-node-cpu-memory" && cd "$AUDIT_DIR/07-node-cpu-memory"
+. lib/init.sh
+focus_dir 07-node-cpu-memory
 ```
 
-### Step 1 — capacity and allocatable
+### Step 1 — capacity, allocatable and current usage in one table
 
 ```bash
-kubectl get nodes -o json > nodes-raw.json
-
-jq -r '(["NODE","ROLE","CPU_CAP","CPU_ALLOC","MEM_CAP_GiB","MEM_ALLOC_GiB","MAX_PODS","KUBELET"]|@tsv),
-       (.items[]
-        | [ .metadata.name,
-            ( [ .metadata.labels | keys[] | select(startswith("node-role.kubernetes.io/"))
-                | sub("node-role.kubernetes.io/";"") ] | join(",") ),
-            .status.capacity.cpu,
-            .status.allocatable.cpu,
-            ((.status.capacity.memory   | rtrimstr("Ki") | tonumber)/1048576*100|round/100),
-            ((.status.allocatable.memory| rtrimstr("Ki") | tonumber)/1048576*100|round/100),
-            .status.capacity.pods,
-            .status.nodeInfo.kubeletVersion ] | @tsv)' nodes-raw.json \
-  | tee node-capacity.tsv | column -t
+node_snapshot | tee node-snapshot.tsv | column -t
+node_totals   | tee node-totals.txt
 ```
 
-Validated output:
+Validated:
 
 ```
-NODE                                   ROLE                  CPU_CAP  CPU_ALLOC  MEM_CAP_GiB  MEM_ALLOC_GiB  MAX_PODS
-master-0                               control-plane,master  8        7500m      31.34        30.24          250
-worker-1                               worker                16       15500m     62.79        61.69          250
+NODE      ROLES                 SOURCE         CPU_ALLOC  CPU_USED  CPU_PCT  MEM_ALLOC_GiB  MEM_USED_GiB  MEM_PCT  EPH_CAP_GiB  EPH_USED_GiB  EPH_PCT  PRESSURE
+worker-1  worker                stats/summary  15.5       1.55      10       61.69          23.69         38.4     511.25       167.44        32.8     -
+worker-4  worker                stats/summary  15.5       1.21      7.8      61.69          18.47         29.9     511.25       424.95        83.1     -
+master-0  control-plane,master  stats/summary  7.5        1.61      21.5     30.24          17.53         58       462.94       203.82        44       -
 ```
 
-The gap between capacity and allocatable is kube/system-reserved: 500 m CPU and ~1.1
-GiB on these nodes. Never size against capacity.
+```
+nodes counted     : 6 (workers)
+cpu               : 8.61 of 93.00 cores allocatable in use (9.3%)
+memory            : 130.8 of 370.1 GiB allocatable in use (35.3%)
+ephemeral storage : 1037.8 of 3067.5 GiB in use (33.8%)
+headroom          : 84.39 cores, 239.4 GiB RAM, 2029.7 GiB ephemeral
+```
+
+`node_snapshot` ([../lib/nodes.sh](../lib/nodes.sh)) is the same collection
+`generate-export-topology.py` puts in its report header. One call per node to
+`/api/v1/nodes/<node>/proxy/stats/summary` returns CPU, working-set memory **and** the
+root filesystem, which is the ephemeral storage guide 08 is about; `metrics.k8s.io` is
+the fallback and gives CPU and memory only.
+
+`node_totals` counts **workers only** by default. Masters are normally tainted
+`NoSchedule`, so counting their cores as datamover capacity overstates headroom — pass
+`all` if the taints say otherwise (step 4).
+
+> **This is one sample, not an average.** It says what the cluster looked like when you
+> ran it. Take it *while an export is in flight* and it tells you what the export costs;
+> take it at midday and it tells you nothing about the backup window. Step 3 is the
+> trend.
+
+> **Unit trap.** `status.capacity["ephemeral-storage"]` is a `Ki` quantity
+> (`"536083696Ki"`) while `status.allocatable["ephemeral-storage"]` is a bare byte count
+> (`"492980991592"`). Comparing them as strings, or as the same unit, gives a 1024×
+> error. `node_snapshot` parses quantities; if you write your own, check the suffix.
 
 ### Step 2 — what is already committed
 
@@ -113,9 +117,18 @@ tqr '1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)' \
   | tee "mem-utilisation-${AUDIT_WINDOW_DAYS}d.tsv" | column -t
 ```
 
-Narrow the bounds to the backup window (from guide 02 step 4) and re-run. The difference
-between the whole-window peak and the backup-window peak is the datamover's actual
-footprint on the cluster.
+Narrow the bounds to one of the pair's own export windows and re-run — the difference
+between the whole-window peak and the export-window peak is what the datamover costs:
+
+```bash
+export_actions | head -3 | column -t     # pick an export, note START and END
+S=$(date -u -j -f '%Y-%m-%dT%H:%M:%S' '2026-09-20T08:00:52' +%s)   # GNU date: date -u -d '...' +%s
+E=$(date -u -j -f '%Y-%m-%dT%H:%M:%S' '2026-09-20T08:04:45' +%s)
+tqr 'instance:node_cpu_utilisation:rate1m' "$S" "$E" 15s \
+  | jq -r '.data.result[] | (.values|map(.[1]|tonumber)) as $v
+           | [ (.metric.instance // .metric.node), (($v|max)*1000|round/10) ] | @tsv' \
+  | tee cpu-during-export.tsv | column -t
+```
 
 If `instance:node_cpu_utilisation:rate1m` is not present (it is an OpenShift recording
 rule), use the portable form:
@@ -148,19 +161,35 @@ jq -r '[.items[] | {cpu: .status.capacity.cpu, mem: .status.capacity.memory,
 Taints, and any K10 node affinity, decide which of the above nodes are real candidates.
 
 ```bash
+kubectl get nodes -o json > nodes-raw.json
 jq -r '.items[] | select(.spec.taints)
        | "\(.metadata.name)\t\([.spec.taints[] | "\(.key)=\(.value // "")\(.effect)"] | join(","))"' \
    nodes-raw.json | tee node-taints.tsv
 
-# K10 worker-pod placement, if configured
-kubectl -n "$K10NS" get actionpodspecs -o yaml 2>/dev/null \
-  | grep -A20 -E "nodeSelector|affinity|tolerations" | tee datamover-placement.txt
+# Where the datamovers of THIS namespace may run. An ActionPodSpecBinding in the
+# application namespace is what overrides placement for it - see guide 10 step 5.
+kubectl -n "$AUDIT_NS" get actionpodspecbindings -o yaml 2>/dev/null | tee aps-binding.yaml
+kubectl -n "$K10NS" get actionpodspecs -o yaml 2>/dev/null | tee actionpodspecs.yaml
+```
+
+Validated: both empty on this cluster, so datamovers for `$AUDIT_NS` are scheduled with
+no nodeSelector, no affinity and no tolerations — they land wherever the scheduler puts
+them, and never on a tainted master.
+
+Where they actually landed on the last export, which is the real answer:
+
+```bash
+datamover_for_export "$(export_actions | awk -F'\t' 'NR==2 {print $1}')" \
+  | tee datamover-placement.txt
 ```
 
 ## Caveats
 
 - **Allocatable ≠ available.** Subtract existing requests (step 2) before claiming
-  headroom.
+  headroom. `node_totals` reports allocatable-versus-used, which is a different and
+  more optimistic number than allocatable-versus-requested.
+- **One sample is not a trend.** Step 1 is an instant; step 3 is the window. Never
+  present step 1 as "the node is fine".
 - **Masters usually cannot host datamovers** because of the
   `node-role.kubernetes.io/master:NoSchedule` taint. Exclude them from the headroom
   calculation unless step 5 shows a matching toleration. On the validation cluster the
@@ -187,14 +216,22 @@ kubectl -n "$K10NS" get actionpodspecs -o yaml 2>/dev/null \
 
 ## Validation status
 
-Steps 1, 2, 4 and 5 fully validated on the validation cluster: 9 nodes, 3 masters at
-8 CPU / 31.3 GiB and 6 workers at 16 CPU / 62.8 GiB;
-`kube_node_status_capacity` and `kube_node_status_allocatable` each returned 72 series.
-The step 2 PromQL returned sensible commitment figures — workers between 32.4 % and
-71.9 % of allocatable CPU already requested, masters between 62.8 % and 75.5 %.
+Steps 1, 2, 4 and 5 fully validated on K10 9.0.5 / OpenShift 4.18: 9 nodes, 3 masters at
+7.5 allocatable cores / 30.24 GiB and 6 workers at 15.5 / 61.69. `node_snapshot`
+returned `stats/summary` as the usage source for every node, and its capacity and
+allocatable figures match `generate-export-topology.py`'s `nodes` block. Worker
+headroom at the time of sampling: 84.39 cores and 239.4 GiB.
 
-Step 3's dependencies were confirmed present on OpenShift 4.18:
-`instance:node_cpu_utilisation:rate1m` and `node_memory_MemAvailable_bytes` both
-resolved to 9 series. The queries were re-validated using `AUDIT_START`/`AUDIT_END` from
-guide 00 §6 (15 days on that cluster). The queries are validated; the trend
-interpretation is not, since the validation cluster carried no sustained load.
+One worker reported **83.1 %** ephemeral-storage use against the others' 18–33 % — the
+kind of imbalance that decides where a datamover must not be scheduled. Guide 08 step 4
+turns that into a margin-to-eviction figure.
+
+Step 2's PromQL returned sensible commitment figures. Step 3's dependencies were
+confirmed present: `instance:node_cpu_utilisation:rate1m` and
+`node_memory_MemAvailable_bytes` both resolve. Step 5 returned empty `ActionPodSpec`
+and `ActionPodSpecBinding` lists, consistent with the `resources: {}` observed on live
+datamover pods in guide 09.
+
+Not validated: the trend interpretation itself. The queries are correct; the validation
+cluster carried no sustained load outside the export windows, so a "node is saturated
+during backups" finding was not reproduced.

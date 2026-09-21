@@ -12,7 +12,8 @@ confusing.
 |---|---|---|
 | 1 | **Override** | export anything non-default — `K10NS`, `AUDIT_DIR`, `PROM_URL`, `PROM_NS` |
 | 2 | **Source** | `. lib/init.sh` — does all the setup and prints `audit_status` |
-| 3 | **Verify + record** | the remaining sections below are checks, not setup |
+| 3 | **Focus** | `audit_focus <ns> <policy>` — every guide collects that pair only (§10) |
+| 4 | **Verify + record** | the remaining sections below are checks, not setup |
 
 ```bash
 # 1. overrides, only if you need them
@@ -22,7 +23,11 @@ export K10NS=kasten-io            # default
 # 2. the one line that sets everything up. Do NOT pipe it - see the note below.
 . lib/init.sh
 
-# 3. verify and record
+# 3. pin the audit to ONE namespace and ONE export policy - see section 10
+audit_focus_candidates
+audit_focus <NAMESPACE> <POLICY>
+
+# 4. verify and record
 prom_check
 audit_preflight
 audit_window_report
@@ -115,7 +120,9 @@ echo "$AUDIT_DIR"          # created by init.sh
 **reuses** it and replays `00-audit-env.sh`, so the metrics window stays pinned across
 sessions. To place it elsewhere, `export AUDIT_DIR=...` in phase 1.
 
-Each guide writes into `$AUDIT_DIR/<NN>-<name>/`.
+Each guide writes into `$AUDIT_DIR/<namespace>.<policy>/<NN>-<name>/`, created by
+`focus_dir` (§10). Nesting under the pair is what lets you audit a second
+namespace/policy into the same `AUDIT_DIR` without overwriting the first one's files.
 
 ## 4. K10's own Prometheus
 
@@ -321,6 +328,7 @@ cannot drift from what is actually checked.
 | **Read the cluster** | `nodes`, `namespaces`, `persistentvolumes`, `persistentvolumeclaims`, `pods`, `storageclasses`, `volumesnapshotclasses` | the inventory the whole audit is built on |
 | **Read kubelet stats** | `nodes/proxy` | the *only* source of per-pod ephemeral-storage and per-volume inode data. Not in most read-only roles, and guides 04 and 08 cannot be produced without it |
 | **Read the K10 API** | `policies`, `profiles`, `actionpodspecs`, `k10s`, `exportactions`, `restorepoints`, `applications`, `storagerepositories` | policies, schedules, restore points and repositories. These are aggregated APIs, not CRDs, so a generic CRD read role does not cover them |
+| **Read export details** | `exportactions/details` in application namespaces | the **only** place K10 exposes what an export moved (`transferredBytes`, `readBytes`, per-volume operations). On the ExportAction object itself those fields are `null`. Guides 06 and 13 have no byte counters without it |
 | **Read K10 config** | `configmaps`, `deployments`, `secrets` **in the K10 namespace only** | `k10-config` holds the effective tuning; the Helm release lives in a Secret, so `helm get values` needs Secret read; the object-store credential is consumed by the object-count pod |
 | **Read K10 logs** | `pods/log`, `events` | guide 13 reads orchestration logs and worker-pod warnings |
 | **Port-forward** | `pods/portforward` in the K10 namespace | K10's own Prometheus, `metering-svc` and `jobs-svc` have no route |
@@ -427,6 +435,78 @@ check like this ends up being ignored. The patterns live in
 [../lib/provenance.sh](../lib/provenance.sh) and are tested against JWTs, OpenShift
 `sha256~` tokens, AWS secret keys, htpasswd hashes and bare passwords.
 
+## 10. Pin the audit to one namespace and one policy
+
+```bash
+audit_focus_candidates
+audit_focus <NAMESPACE> <POLICY>
+```
+
+Guides 01–13 collect, by hand, the same data that
+[`generate-export-topology.py`](../generate-export-topology.py) collects automatically.
+By hand that is only tractable for **one export problem at a time**, so every guide
+reads the pair from the environment:
+
+| Variable | Meaning |
+|---|---|
+| `AUDIT_NS` | the application namespace |
+| `AUDIT_POLICY` | the export policy that selects it |
+| `AUDIT_PROFILE` | the Location Profile that policy exports to — resolved for you |
+
+These are exactly the generator's `--namespace` / `--policy` arguments, which is why
+the two agree. `audit_focus` prints the equivalent command; run it to cross-check any
+figure in this collection:
+
+```
+generate-export-topology.py --namespace prod-test --policy calibrate-backup
+```
+
+### Why a pair and not just a namespace
+
+One namespace can be exported by several policies into several profiles, and **each
+(namespace, profile) pair has its own Kopia repository**. Mixing two of them is how a
+change rate ends up attributed to the wrong schedule. Pick the pair whose exports are
+the problem.
+
+### Choosing
+
+```bash
+audit_focus_candidates | column -t
+```
+
+Validated output:
+
+```
+NAMESPACE         POLICY                  PROFILE              EXPORT_FREQ  PAUSED  RESTORE_POINTS
+basic-app         basic-app-backup        my-s3-bucket         @onDemand    false   4
+clusters          clusters-backup         my-s3-bucket         @hourly      true    0
+large-test        calibrate-backup        my-s3-profile        @hourly      false   9
+large-test-block  calibrate-backup-block  my-s3-profile        @hourly      false   7
+mastodon          mastodon-backup         azurefile-filestore  @daily       false   6
+prod-test         calibrate-backup        my-s3-profile        @hourly      false   10
+```
+
+Only policies with an **export** action appear: an export is what creates a datamover
+pod, a Kopia repository, object-storage consumption and a measurable duration. A
+backup-only policy produces local snapshots and there is nothing to measure.
+
+`RESTORE_POINTS` is the pre-filter. A namespace with **0** was never backed up, so it
+was never exported and there is no repository to connect to — guides 04–06, 11 and 12
+will find nothing. That column also cuts a VM policy selecting `*` back down to size:
+it otherwise resolves to every namespace on the cluster.
+
+`audit_focus` warns rather than refuses when the pair looks odd — no restore point, a
+paused policy, `exportData` disabled, or a namespace it cannot resolve from the
+selector (expected for a VM policy, which `lib/policies.sh` deliberately does not
+resolve). Read the warnings; they predict which later guide will come back empty.
+
+### The pair is recorded
+
+`audit_record` writes `AUDIT_NS` / `AUDIT_POLICY` / `AUDIT_PROFILE` into both
+`00-prerequisites.txt` and `00-audit-env.sh`, so a resumed session stays on the same
+pair and the deliverable says which one it describes. To audit a second pair, run
+`audit_focus` again — the output directories are nested per pair (§3).
+
 ## What to send back
 
 | File | Contents |
@@ -434,3 +514,7 @@ check like this ends up being ignored. The patterns live in
 | `00-prerequisites.txt` | cluster, K10 version and install method, metrics window, tooling, permissions |
 | `00-audit-env.sh` | re-sourceable environment pinning the audit window across sessions |
 | `metrics-window.txt` | the §6 window derivation, including replica uptimes |
+
+The provenance record names the pinned pair. Every other guide's deliverable describes
+**that pair only** — say so in the report rather than letting a per-namespace figure
+read as a cluster-wide one.

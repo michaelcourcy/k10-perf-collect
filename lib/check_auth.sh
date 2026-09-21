@@ -32,7 +32,9 @@ guide 01 02 : policies|get|policies.config.kio.kasten.io|-n|$_k
 guide 11 12 : Location Profiles|get|profiles.config.kio.kasten.io|-n|$_k
 guide 10 : ActionPodSpec overrides|get|actionpodspecs.config.kio.kasten.io|-n|$_k
 guide 10 : operator CR, if operator-installed|get|k10s.apik10.kasten.io|-n|$_k
-guide 13 : action history and state|get|exportactions.actions.kio.kasten.io|-n|$_k
+guide 02 : policy runs and metadata exports|get|exportactions.actions.kio.kasten.io|-n|$_k
+guide 01 06 13 : per-application exports|get|exportactions.actions.kio.kasten.io|--all-namespaces
+guide 06 13 : export byte counters and per-volume detail|get|exportactions.actions.kio.kasten.io/details|--all-namespaces
 guide 01 12 : restore points|get|restorepoints.apps.kio.kasten.io|--all-namespaces
 guide 01 : applications K10 can see|get|applications.apps.kio.kasten.io|--all-namespaces
 guide 12 : Kopia repository inventory|get|storagerepositories.repositories.kio.kasten.io|-n|$_k

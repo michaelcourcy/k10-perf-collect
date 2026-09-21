@@ -1,6 +1,6 @@
 # 10 — Helm and ActionPodSpec configuration around the datamovers
 
-## What Global Engineering needs
+## What auditors need
 
 The complete, effective configuration that governs datamover behaviour: the Helm values
 in force, the derived `k10-config` tuning keys, the feature flags, and any
@@ -24,22 +24,17 @@ On an operator-based install, `kubectl get k10s.apik10.kasten.io` replaces (1). 
 cluster can have both: the validation cluster had a Helm release `k10-9.0.5` *and* a
 `K10` CR, and the two agreed.
 
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
-
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/10-config" && cd "$AUDIT_DIR/10-config"
+. lib/init.sh
+focus_dir 10-config
 ```
+
+This is the one guide that is mostly **cluster-wide by nature**: `k10-config` and the
+Helm values govern every namespace. Only step 5 is scoped to `$AUDIT_NS` — an
+`ActionPodSpecBinding` lives in the application namespace and is the only per-namespace
+override there is.
 
 ### Step 0 — set up redaction
 
@@ -141,6 +136,25 @@ Validated values on the validation cluster, K10 9.0.5 defaults throughout:
 | `csiSnapshotCreationTimeout` | 10m | CSI snapshot create timeout |
 | `csiSnapshotReadyTimeout` | 30m | CSI snapshot ready timeout |
 
+Two of these only mean something multiplied by the pair's fan-out from guide 02
+step 1:
+
+```bash
+NS_COUNT=$(awk -F'\t' 'NR==2 {print $9}' \
+  "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/02-policy-frequency/policy-frequency.tsv")
+CACHE=$(jq -r '.k10DataStoreTotalCacheSizeLimitMB' datamover-tuning.json)
+PERACT=$(jq -r '.K10LimiterSnapshotExportsPerAction' datamover-tuning.json)
+PERCLU=$(jq -r '.K10LimiterSnapshotExportsPerCluster' datamover-tuning.json)
+printf 'policy exports %s namespaces; up to %s volumes each, %s cluster-wide\n' \
+       "$NS_COUNT" "$PERACT" "$PERCLU"
+printf 'worst-case node-local cache: %s MB x %s = %s MB\n' \
+       "$CACHE" "$PERCLU" "$((CACHE * PERCLU))"
+```
+
+Validated: 3 namespaces, 3 volumes per action, 10 cluster-wide, 3000 MB × 10 =
+**30000 MB** of node-local Kopia cache in the worst case. Guide 08 step 4 checks that
+against the actual node margin.
+
 Capture the full set rather than only these, since defaults move between releases:
 
 ```bash
@@ -181,12 +195,21 @@ Validated content, with the performance-relevant entries called out:
 
 ```bash
 kubectl -n "$K10NS" get actionpodspecs -o yaml | tee actionpodspecs.yaml
-kubectl -n "$K10NS" get actionpodspecbindings -o yaml | tee actionpodspecbindings.yaml
+
+# the binding is in the APPLICATION namespace - this is the per-namespace override
+kubectl -n "$AUDIT_NS" get actionpodspecbindings -o yaml | tee aps-binding-"$AUDIT_NS".yaml
+kubectl get actionpodspecbindings -A \
+  -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,SPEC:.spec.actionPodSpecRef.name' \
+  | tee actionpodspecbindings-all.txt
 ```
 
-On the validation cluster **both were empty** (`items: []`). That means datamover pods
-get no resource requests, no limits, no node selector and no tolerations — confirmed
+Validated: **all empty** (`items: []`). Datamover pods for `$AUDIT_NS` therefore get no
+resource requests, no limits, no node selector and no tolerations — confirmed
 independently in guide 09, where every worker-pod container had `resources: {}`.
+
+The all-namespaces listing matters even when your namespace has no binding: a binding
+elsewhere changes what the *concurrent* datamovers (guide 09 step 2) cost, and
+therefore what the node has to absorb.
 
 Also capture the related override CRDs, which affect the same pods:
 

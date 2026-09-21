@@ -1,268 +1,259 @@
 # 06 — Change rate
 
-## What Global Engineering needs
+## What auditors need
 
-How much data actually changes between two backup cycles. This is what determines
-incremental export duration, repository growth, object-storage cost, and how much
-maintenance work Kopia has to do. It is the hardest figure on the list to obtain
+How much data actually changes between two export cycles for `$AUDIT_NS`. This
+determines incremental export duration, repository growth, object-storage cost and how
+much maintenance work Kopia has to do. It is the hardest figure on the list to obtain
 honestly, and the one most often replaced by a guess.
 
-## What "change rate" has to mean here
+## Four quantities, all called "change rate"
 
-Three different quantities get called "change rate", and they differ by an order of
-magnitude on real data:
+They differ by an order of magnitude on real data. Collect the first three; the fourth
+is the one to distrust.
 
-| Quantity | Definition | Where to get it |
-|----------|-----------|-----------------|
-| **Logical growth** | net change in total file bytes on the volume between two snapshots | Kopia snapshot stats, per PVC |
-| **Churn** | bytes rewritten, whether or not the total changed | Kopia content creation timestamps, per repository |
-| **Physical ingest** | bytes actually uploaded after dedup and compression | Kopia content `length`, per repository |
+| Quantity | Definition | Source |
+|---|---|---|
+| **Physical ingest** | bytes that actually reached the object store, after dedup and compression | Kopia content timestamps, per snapshot |
+| **Files changed** | files Kopia had to hash, against files it skipped | `stats.fileCount` / `cachedFiles`, per snapshot |
+| **Transferred** | what K10 itself says it moved | ExportAction `/details`, per export |
+| **Logical growth** | net change in total file bytes on the volume | `summ.fileSize` delta, per snapshot |
 
-The recommendation needs **physical ingest** for storage and network sizing, and
-**logical growth** per PVC to spot which namespace is responsible. Collect both.
-
-## The method that is not reliable
-
-The intuitive approach is Kopia's `cachedFiles` / `nonCachedFiles` per snapshot: files
-skipped as unchanged against the previous snapshot, and files Kopia had to hash. The
-mechanism does exist under K10 - it compares against the previous snapshot manifest,
-not a local cache - but it is not dependable across volumes:
-
-```
-data-mastodon-elasticsearch-data-0  (managed-csi)  2nd snapshot  files=167 cached=153 nonCached=14   correct
-basic-app-pvc-2026-07-21-08-24-17   (nfs-csi)    2nd snapshot  files=3   cached=0   nonCached=3    wrong: 1 of 3 was unchanged
-```
-
-On a first snapshot `cachedFiles` is always 0. Where it works it is a good per-PVC
-change indicator (`generate-export-topology.py` reports it as `filesHashed` /
-`filesUnchanged`); where it reports 0 on a later snapshot, trust the methods below
-instead. Note also that `stats.fileCount` is the number of files *hashed*, not the files
-in the snapshot - that is `rootEntry.summ.files`.
-
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
+Logical growth is last for a reason: it is **net**, so a volume where 10 GiB is
+rewritten in place every night reports **zero**. Databases and log-structured stores
+behave exactly that way. When logical growth says nothing changed and physical ingest
+says 10 GiB, you have found an in-place-rewrite workload — say so, it changes the
+retention recommendation.
 
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/06-change-rate" && cd "$AUDIT_DIR/06-change-rate"
+. lib/init.sh
+focus_dir 06-change-rate
+cp "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/04-files-per-pvc/kopia-snapshots.json" .
 ```
 
-### Step A — physical ingest per day, from Kopia content timestamps
+Needs the `debug-kopia-*` pod from guide 12 step 4.
 
-This is the authoritative measurement. Every content block Kopia writes carries its
-creation time, its logical size (`originalLength`) and its stored size (`length`).
-Bucketing by day gives the repository's true ingest rate — after deduplication and
+### Step 1 — files changed per snapshot
+
+Free — it is already in the manifests:
+
+```bash
+kopia_snapshots | tee files-changed.tsv | column -t
+```
+
+```
+PVC                   START                DUR_S  FILES   HASHED  UNCHANGED  D_FILES  D_BYTES
+calibrate-100k-500kb  2026-09-19T08:14:33  531    100003  100003  0          -        -
+calibrate-100k-500kb  2026-09-19T17:01:48  1      100003  0       100003     0        0
+calibrate-100k-500kb  2026-09-19T22:01:53  187    100003  20000   80003      0        0
+calibrate-100k-500kb  2026-09-20T02:37:56  1      100003  0       100003     0        0
+calibrate-100k-500kb  2026-09-20T08:01:37  183    100003  20000   80003      0        0
+```
+
+`HASHED / FILES` is the change indicator: 20000/100003 = **20 %** on the two long runs,
+0 % on the two short ones. It survives maintenance, unlike the timestamp-based method
+below, and costs nothing.
+
+`D_BYTES` is 0 throughout while 20 % of files were rewritten — the in-place-rewrite
+signature above, in one table.
+
+Two limits: `HASHED` is 0 on a first snapshot by construction, and it was seen wrongly
+0 on an `nfs-csi` volume. Corroborate with step 2 or step 3.
+
+### Step 2 — physical ingest per snapshot
+
+The authoritative measurement. Every content block Kopia writes carries its creation
+time, its logical size (`originalLength`) and its stored size (`length`). Blocks whose
+timestamp falls inside a snapshot's window are that snapshot's ingest — after dedup and
 compression, which is exactly what the object store and the network see.
 
-Connect to the repository as described in
-[12-kopia-repository-diagnostics.md](12-kopia-repository-diagnostics.md), then:
+```bash
+kopia_exec 'kopia content list --json' > contents.json
+kopia_exec 'kopia maintenance info --json' > kopia-maintenance-info.json
+wc -c contents.json
+
+kopia_ingest | tee physical-ingest.tsv | column -t -s "$(printf '\t')"
+```
+
+Validated:
+
+```
+PVC                   SNAPSHOT_START       PHYSICAL_BYTES  LOGICAL_BYTES  CONTENTS  RATIO  AMBIGUOUS_BYTES  NOTE
+calibrate-100k-500kb  2026-09-19T08:14:33  51205587472     51217835489    100011    1      0                -
+calibrate-100k-500kb  2026-09-19T17:01:48  589             561            1         1.05   0                -
+calibrate-100k-500kb  2026-09-19T22:01:53  10243350085     10257835205    20006     0.999  0                -
+calibrate-100k-500kb  2026-09-20T02:37:56  594             566            1         1.049  0                -
+calibrate-100k-500kb  2026-09-20T08:01:37  10243352516     10257835217    20006     0.999  0                -
+(unattributed)        -                    3151            2955           7         -      0                written outside every snapshot window
+```
+
+10.24 GB of 51.2 GB is **20.0 %** — the same answer step 1 gave from a completely
+independent field. 20,006 contents against 20,000 hashed files is the same agreement
+again.
+
+`RATIO` is physical ÷ logical: the effective dedup-and-compression factor. **1.0 here
+because the data is random** and does not compress; encryption overhead pushes the
+two near-empty snapshots slightly above 1.0. A ratio of 0.4 would mean 60 % reduction.
+
+Three things this function does that a naive per-window sum does not:
+
+- **Each block is attributed to exactly one snapshot**, the nearest window by midpoint.
+  The PVCs of a namespace are exported concurrently, so their windows overlap; summing
+  per window double-counts. Blocks that fell in more than one window are still counted
+  once and their bytes reported as `AMBIGUOUS_BYTES`, so the guess is visible.
+- **Snapshots older than the last full maintenance report `UNRECOVERABLE`, never 0.**
+  See the warning below.
+- **Blocks matching no window are reported** as `(unattributed)` rather than dropped —
+  maintenance rewrites, or an export whose snapshot has been retired.
+
+> **Physical ingest has a shelf life of one maintenance cycle.**
+> `full-rewrite-contents` re-stamps every rewritten content and pack blob with the
+> maintenance time, after which per-snapshot attribution is gone for good. The default
+> full cycle is 24 h. Run this guide within a day of the exports you care about, and
+> check when the last full run was:
+>
+> ```bash
+> jq -r '.schedule.runs["full-rewrite-contents"] | last | {start,end,success}' \
+>    kopia-maintenance-info.json
+> ```
+>
+> Validated: `2026-09-19T08:14:41Z`, success. Everything before that timestamp would
+> read `UNRECOVERABLE`.
+
+### Step 3 — what K10 says it transferred
+
+Independent of Kopia, and it **survives maintenance** — the one measurement that does.
 
 ```bash
-DEBUG_POD=debug-kopia-xxxxx   # printed by repo-checker -o connect
-
-kubectl -n "$K10NS" exec "$DEBUG_POD" -- sh -c \
-  'export KOPIA_CONFIG_PATH=/tmp/kopia-repository.config; kopia content list --json' \
-  > contents.json
+export_table 10 | tee export-change-rate.tsv | column -t
 ```
 
-Aggregate. Time bucketing is done in `jq`, not `awk`, because BSD/macOS `awk` has no
-`strftime`:
+Validated:
+
+```
+EXPORT                STATE     START                DUR_S  VOLUMES  TRANSFERRED  READ         CAPACITY     RATE_B_S    CHANGE_RATE
+scheduled-gn9w65njrc  Complete  2026-09-20T08:00:52  233    1        10300000000  10200000000  79456894976  219504793   0.2012
+scheduled-cdzgsbrfkz  Complete  2026-09-20T02:37:14  47     1        173          0            79456894976  1095333144  0
+scheduled-5x9wblcnls  Complete  2026-09-19T22:01:10  236    1        10300000000  10200000000  79456894976  216795966   0.2012
+scheduled-qhfwmmm2x4  Complete  2026-09-19T17:00:57  55     1        173          0            79456894976  918134538   0
+scheduled-gjmzmxzwqp  Complete  2026-09-19T08:13:43  587    1        51200000000  51200000000  79456894976  87304917    1
+```
+
+**`CHANGE_RATE` 0.2012 against a workload rewriting exactly 20,000 of 100,003 files.**
+Three independent measurements — hashed files, Kopia content bytes, K10's own
+`transferredBytes` — agree to three significant figures. And the first export reads
+1.0: everything is new.
+
+`CHANGE_RATE` is `transferredBytes` divided by the logical size of the PVC snapshots
+the export took. It can exceed 1.0 on incompressible small files, because
+`transferredBytes` includes Kopia's directory entries and per-block encryption
+overhead — 105 % was observed on a 5 M-file volume of random data. It is the best
+single figure available, not a measured change rate.
+
+`CAPACITY` is `progressDetails.totalBytes`, which is the **volume capacity**
+(79.5 GB = the 74 GiB PVC), not the data size. Do not read it as a denominator.
+
+> **These counters are only on the `/details` subresource.** On the ExportAction object
+> itself `status.progressDetails` and `status.actionDetails` are both `null`, which is
+> why they were long believed not to exist. Verified on this cluster: the object
+> reported `null` while
+> `GET .../exportactions/scheduled-gn9w65njrc/details` returned
+> `transferredBytes: 10300000000` — within 0.6 % of Kopia's 10,243,352,516 for the same
+> window. Each fetch costs about 0.2 s and 400 kB, so fetch the exports you are
+> analysing, not the whole history.
+
+### Step 4 — when the tool and the workload disagree, suspect the workload
+
+A change rate near 100 % on every export usually is not a measurement error.
+
+On this cluster the 5 M-file calibration pod crash-looped on **inode exhaustion** —
+74 GiB ext4 gives 4,849,664 inodes at the default 16 KiB ratio, so `df -i` hit 100 %
+while blocks were at 77 %. The pod died before writing its `touch initial` marker and
+regenerated every file from scratch on each restart, so each export really was ~100 %
+new data. K10's `readBytes` / `processedBytes` / `transferredBytes` and Kopia's
+hashed-versus-unchanged all agreed with each other, and all of them were right.
 
 ```bash
-jq -r '
- [ .[] | select(.deleted == false)
-   | {day: (.time | strftime("%Y-%m-%d")), logical: .originalLength, physical: .length} ]
- | group_by(.day)
- | map({day: .[0].day,
-        contents: length,
-        logical_MiB:  ((map(.logical) |add)/1048576*100|round/100),
-        physical_MiB: ((map(.physical)|add)/1048576*100|round/100)})
- | (["DAY","CONTENTS","LOGICAL_MiB","PHYSICAL_MiB"]|@tsv),
-   (.[] | [.day,.contents,.logical_MiB,.physical_MiB]|@tsv)' contents.json \
-  | tee change-rate-daily.tsv | column -t
+kubectl -n "$AUDIT_NS" get pods -o wide | tee pods.txt
+kubectl -n "$AUDIT_NS" get events --sort-by=.lastTimestamp | tail -30 | tee events.txt
 ```
 
-Validated output (one hour of activity, two backup cycles, ~5 MiB of new data):
+Also: Kopia's incremental base can be a **checkpoint of a failed export**, so
+`UNCHANGED` may exceed the previous complete snapshot's file count.
 
-```
-DAY         CONTENTS  LOGICAL_MiB  PHYSICAL_MiB
-2026-09-15  20        20.3         8.06
-```
-
-Swap `%Y-%m-%d` for `%Y-%m-%dT%H:00Z` to get hourly buckets and see the backup window
-itself:
+### Step 5 — repository growth, as an independent sanity check
 
 ```bash
-jq -r '
- [ .[] | select(.deleted == false)
-   | {h: (.time | strftime("%Y-%m-%dT%H:00Z")), l: .originalLength, p: .length} ]
- | group_by(.h)
- | map({h: .[0].h, n: length,
-        logical_MiB:  ((map(.l)|add)/1048576*100|round/100),
-        physical_MiB: ((map(.p)|add)/1048576*100|round/100)})
- | (["HOUR","CONTENTS","LOGICAL_MiB","PHYSICAL_MiB"]|@tsv),
-   (.[] | [.h,.n,.logical_MiB,.physical_MiB]|@tsv)' contents.json \
-  | tee change-rate-hourly.tsv | column -t
+kopia_exec 'kopia blob stats' | tee "blob-stats-$(date -u +%Y%m%dT%H%MZ).txt"
 ```
 
-The ratio `physical / logical` is the effective dedup+compression factor. On the
-validation cluster it was 8.06 / 20.3 = **0.40**, i.e. 60 % reduction.
+Run it twice a week apart and difference the totals. Independent of Kopia's own
+per-snapshot accounting and of K10's counters.
 
-### Step B — logical growth per PVC, from consecutive snapshots
+### Step 6 — when no repository exists yet
 
-Step A is repository-wide. This attributes growth to individual PVCs, which is what
-identifies the namespace to act on.
-
-Net logical growth per PVC comes straight from guide 12's `inventory.json` — no
-repository connection needed:
+Only for a pair that has never exported. Bound from volume-level growth:
 
 ```bash
-kopia_pvc_growth | tee logical-growth-per-pvc.tsv | column -t -s "$(printf '\t')"
-```
-
-```
-NAMESPACE  PVC                                FROM                  TO                    DELTA_BYTES  DELTA_MiB
-basic-app  basic-app-pvc                      2026-09-15T13:07:46Z  2026-09-15T13:18:39Z  0            0.00
-basic-app  basic-app-pvc-2026-07-21-08-24-17  2026-09-15T13:07:49Z  2026-09-15T13:18:40Z  5244736      5.00
-```
-
-5 244 736 B is exactly the 3 MiB + 2 MiB written between those two cycles.
-
-`kopia_inventory_pvcs` gives the underlying per-snapshot rows, with the workload and a
-`RESOLVED` column — see [../lib/kopia.sh](../lib/kopia.sh). One Kopia repository holds
-many PVCs; they are distinguished by `Source.host`, which the library parses for you.
-
-If you are already connected to the repository (guide 12 step 4), the same figures plus
-the file-count delta come from `kopia-snapshots.json`:
-
-```bash
-# kopia-snapshots.json comes from guide 04 step C
-jq -r '
- group_by(.source.host)
- | map( sort_by(.startTime)
-        | [ range(1; length) as $i
-            | { pvc:   (.[$i].source.host | split(".") | last),
-                from:  .[$i-1].startTime,
-                to:    .[$i].startTime,
-                d_files: (.[$i].stats.fileCount     - .[$i-1].stats.fileCount),
-                d_bytes: (.[$i].stats.totalFileSize - .[$i-1].stats.totalFileSize) } ] )
- | flatten
- | (["PVC","FROM","TO","DELTA_FILES","DELTA_BYTES","DELTA_MiB"]|@tsv),
-   (.[] | [.pvc,.from,.to,.d_files,.d_bytes,(.d_bytes/1048576*100|round/100)]|@tsv)' \
-   "$AUDIT_DIR/04-files-per-pvc/kopia-snapshots.json" \
-  | tee logical-growth-per-pvc.tsv | column -t
-```
-
-Validated output:
-
-```
-PVC                                DELTA_FILES  DELTA_BYTES  DELTA_MiB
-basic-app-pvc                      0            0            0
-basic-app-pvc-2026-07-21-08-24-17  2            5244736      5
-```
-
-5 244 736 B is exactly the 3 MiB + 2 MiB written between the two cycles. The
-measurement is sound.
-
-This is **net** growth. A volume where 10 GiB is rewritten in place every night shows
-`d_bytes = 0` here while contributing 10 GiB to step A. When step B says zero and step
-A says a lot, you have found an in-place-rewrite workload — databases and log-structured
-stores behave this way. Say so in the report; it changes the retention recommendation.
-
-### Step C — repository growth over time, as a sanity check
-
-Independent of Kopia's own accounting. Run it twice, a week apart, and difference it.
-
-```bash
-# see guide 11 for the mc pod; then, per repository prefix:
-kubectl -n "$K10NS" exec objcount -- sh -c \
-  'mc alias set t "$S3_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null
-   mc du --depth 6 "t/$BUCKET"' | tee "repo-du-$(date -u +%Y%m%dT%H%MZ).txt"
-```
-
-Also available from K10's own Prometheus, if the profile is used for exports:
-
-```bash
-kq 'catalog_storage_artifact_count' \
-  | jq -r '.data.result[] | "\(.metric.category)/\(.metric.retirement)\t\(.value[1])"' \
-  | tee artifact-count.tsv
-```
-
-### Step D — the indirect estimate, when no repository exists yet
-
-Export metrics can be used to bound the change rate indirectly. Where no Kopia
-repository is available, estimate it from volume-level growth:
-
-```bash
-# AUDIT_START / AUDIT_END / AUDIT_WINDOW_DAYS are exported by lib/init.sh.
-tqr 'max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes)' \
+tqr 'max by (persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace="'"$AUDIT_NS"'"})' \
     "$AUDIT_START" "$AUDIT_END" 1h \
-  | jq -r '(["NAMESPACE","PVC","FIRST_GiB","LAST_GiB","DELTA_GiB"]|@tsv),
+  | jq -r '(["PVC","FIRST_GiB","LAST_GiB","DELTA_GiB"]|@tsv),
            (.data.result[]
             | (.values | map(.[1]|tonumber)) as $v
-            | [ .metric.namespace, .metric.persistentvolumeclaim,
+            | [ .metric.persistentvolumeclaim,
                 (($v|first)/1073741824*100|round/100),
                 (($v|last)/1073741824*100|round/100),
                 ((($v|last)-($v|first))/1073741824*100|round/100) ] | @tsv)' \
   | tee "used-bytes-${AUDIT_WINDOW_DAYS}d-delta.tsv" | column -t
 ```
 
-The delta covers `AUDIT_WINDOW_DAYS`, not a week. Divide by
-`$AUDIT_WINDOW_DAYS` for a daily rate and label the output with the window.
-
-**Treat this as a lower bound only.** It measures net used-space change, misses all
-in-place rewrites, and — per guide 04 — is meaningless for NFS-backed PVCs, where every
-PVC on the same export reports the same number. Restrict it to `pvc-block.txt`.
+**A lower bound only.** It measures net used-space change, misses every in-place
+rewrite, and per guide 04 is meaningless for NFS-backed PVCs. The delta covers
+`AUDIT_WINDOW_DAYS`, not a week — divide and label it.
 
 ## Caveats
 
-- **`kopia content list` enumerates the whole content index.** On a large repository
-  that is millions of JSON records — tens of seconds of CPU in the debug pod and a
-  large file locally. Stream it to disk, do not hold it in a shell variable.
-- **Maintenance rewrites content.** After a full maintenance cycle, compacted content
-  gets a *new* timestamp, which inflates the bucket for that day. Cross-check against
-  `maintenance-info-stdout.txt` from guide 12 and exclude days where a full cycle ran
-  (`full-rewrite-contents`).
-- **One repository serves many PVCs.** Step A cannot attribute ingest to a PVC. Use
-  step B for attribution and accept that the two answer different questions.
+- **`kopia content list` enumerates the whole content index.** 140,032 records / 32 MB
+  on this repository, and millions on a large one. Stream it to disk; never hold it in
+  a shell variable.
 - **A short observation window is worthless.** Change rate needs at least two full
-  backup cycles, preferably a week, to include weekly batch jobs. If the repository was
-  recently recreated or migrated, say so instead of extrapolating. Note that step A and
-  step B read the Kopia repository, which is **not** bounded by
-  `AUDIT_WINDOW_DAYS` — Kopia history goes back as far as retention allows, so prefer
-  them whenever the Prometheus window is short.
-- `originalLength` is pre-compression but post-chunking; it is not identical to the sum
-  of file sizes.
+  export cycles, preferably a week, to include weekly batch jobs. Note that steps 1–3
+  read the repository and the action history, which are **not** bounded by
+  `AUDIT_WINDOW_DAYS` — prefer them whenever the Prometheus window is short.
+- **`originalLength` is pre-compression but post-chunking**; it is not identical to the
+  sum of file sizes.
+- **Block-mode volumes** have no `HASHED`/`UNCHANGED` (step 1 prints `-`), because
+  `cachedFiles` holds the block size there. Steps 2 and 3 work normally.
 
 ## What to send back
 
 | File | Contents |
 |------|----------|
-| `change-rate-daily.tsv` | physical and logical ingest per day (headline figure) |
-| `change-rate-hourly.tsv` | same, hourly — shows the backup window |
-| `logical-growth-per-pvc.tsv` | net growth attributed per PVC |
-| `repo-du-*.txt` | repository size snapshots for week-over-week differencing |
-| `used-bytes-<N>d-delta.tsv` | lower-bound estimate for block PVCs, if used; `<N>` = `AUDIT_WINDOW_DAYS` |
-| `contents.json` | raw content index, if size permits |
+| `physical-ingest.tsv` | bytes that reached the object store, per snapshot (headline) |
+| `export-change-rate.tsv` | K10's own transferred bytes and change rate, per export |
+| `files-changed.tsv` | hashed versus unchanged files, per snapshot |
+| `kopia-maintenance-info.json` | when the last full maintenance re-stamped the contents |
+| `blob-stats-*.txt` | repository size snapshots for week-over-week differencing |
+| `contents.json` | the raw content index, if size permits |
 
 ## Validation status
 
-Steps A and B fully validated on K10 9.0.5, end to end: two backup cycles were run 11
-minutes apart with 5 MiB of new data written in between, and both the repository-wide
-ingest (20.3 MiB logical / 8.06 MiB physical) and the per-PVC delta (+2 files,
-+5 244 736 B) were reproduced exactly. The `cachedFiles` behaviour described above was
-observed directly on both volumes, not inferred.
+Fully validated on K10 9.0.5 against `prod-test` / `calibrate-backup`, a volume of
+100,003 files of 512 KB each with a known 20,000-file rewrite between cycles. **Three
+independent measurements agreed**: 20,000/100,003 files hashed (step 1),
+10,243,352,516 of 51,200,000,058 bytes physically ingested (step 2, 20.0 %) and a
+`CHANGE_RATE` of 0.2012 from K10's own `transferredBytes` (step 3). The first export
+read 1.0 on all three.
 
-Step C validated mechanically (`mc du` and `catalog_storage_artifact_count` both
-return), but week-over-week differencing was not exercised — the validation cluster had
-one hour of history. Step D validated as a query; its accuracy claim is not testable on
-a cluster with no multi-day PVC growth.
+Step 2's figures match `generate-export-topology.py` byte for byte on the same
+snapshots (51,205,587,472 / 589 / 10,243,350,085 / 594), including the nearest-window
+attribution and the 1-second window padding.
+
+Step 3's `/details` behaviour was verified directly: `progressDetails` null on the
+object, populated on the subresource.
+
+Step 5's week-over-week differencing was not exercised — it needs two runs a week
+apart. Step 6 was validated as a query; its accuracy claim is not testable on a pair
+that has a repository.

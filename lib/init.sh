@@ -108,6 +108,10 @@ fi
 . "$K10_AUDIT_LIB/provenance.sh"
 . "$K10_AUDIT_LIB/check_auth.sh"
 . "$K10_AUDIT_LIB/policies.sh"
+. "$K10_AUDIT_LIB/focus.sh"
+. "$K10_AUDIT_LIB/exports.sh"
+. "$K10_AUDIT_LIB/datamover.sh"
+. "$K10_AUDIT_LIB/nodes.sh"
 . "$K10_AUDIT_LIB/pvcscan.sh"
 . "$K10_AUDIT_LIB/kopia.sh"
 
@@ -180,6 +184,11 @@ audit_status() {
   echo "  prometheus     : ${PROM_URL:-none} (${PROM_URL_IS_CUSTOM:+custom}${PROM_URL_IS_CUSTOM:-openshift})"
   echo "  window         : ${AUDIT_WINDOW_DAYS:-?}d  [${AUDIT_START:-?} .. ${AUDIT_END:-?}]"
   echo "  window basis   : ${AUDIT_WINDOW_BASIS:-?}"
+  if [ -n "${AUDIT_NS:-}" ]; then
+    echo "  focus          : ${AUDIT_NS} / ${AUDIT_POLICY} -> ${AUDIT_PROFILE}"
+  else
+    echo "  focus          : not set - run 'audit_focus <namespace> <policy>' (guide 00 section 10)"
+  fi
 }
 
 AUDIT_READY=yes

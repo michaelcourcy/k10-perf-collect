@@ -1,12 +1,31 @@
 # K10 Performance Audit — Data Collection Guides
 
-This repository contains one guide per data point that Global Engineering needs in
-order to produce Veeam Kasten (K10) configuration recommendations for a protected
-cluster.
+This repository contains one guide per data point that auditors need in order to
+produce Veeam Kasten (K10) configuration recommendations for a protected cluster.
 
 Each guide is self-contained: it states **what** is being collected, **why** it
 matters for the recommendation, the **exact commands** to run, the **caveats** that
 make the result wrong if ignored, and **what to send back**.
+
+**Guides 01–13 are the manual counterpart of one focused generator run.** They collect
+the same data as `generate-export-topology.py --namespace NS --policy POLICY`, for one
+(namespace, policy) pair at a time, using the same fields and the same helpers. Guide
+00 §10 pins the pair (`audit_focus`); every later guide reads it from `$AUDIT_NS`,
+`$AUDIT_POLICY` and `$AUDIT_PROFILE`. For a whole cluster, run the generator — by hand,
+one export problem at a time is the tractable unit.
+
+| You want | Use |
+|---|---|
+| Every namespace, one JSON, unattended | `generate-export-topology.py` |
+| One export problem, understood step by step | guides 00 → 13 |
+| The same JSON as a report | `render-export-topology.py` |
+
+The two are kept in agreement deliberately: the guide helpers in `lib/kopia.sh`,
+`lib/exports.sh`, `lib/datamover.sh` and `lib/nodes.sh` read the same fields the
+generator reads, and were validated to produce identical figures on the same pair —
+file counts, histogram buckets, per-snapshot physical ingest and change rate. When a
+guide learns something new about a data source, mirror it in the script, and vice
+versa.
 
 ## Automated collection: `generate-export-topology.py`
 
@@ -288,8 +307,10 @@ PVCs that were never exported, at the cost of reading each volume.
 ## How to use this repository
 
 ```bash
-. lib/init.sh          # source it; do not execute it, and do not pipe it
-audit_status           # what it configured
+. lib/init.sh                              # source it; do not execute it, do not pipe it
+audit_status                               # what it configured
+audit_focus_candidates                     # the exporting (namespace, policy) pairs
+audit_focus <NAMESPACE> <POLICY>           # pin one - guides 01-13 collect that pair
 ```
 
 **`lib/init.sh` will not start the audit unless every required permission is granted.**
@@ -312,6 +333,11 @@ for any other Prometheus, export `PROM_URL` first — see the header of
 | [lib/window.sh](lib/window.sh) | derives the effective metrics lookback window |
 | [lib/portforward.sh](lib/portforward.sh) | `pf_start`/`pf_stop` — port-forwards that fail loudly |
 | [lib/check_auth.sh](lib/check_auth.sh) | `check_auth`/`require_auth` — the mandatory authorisation gate |
+| [lib/focus.sh](lib/focus.sh) | `audit_focus` — pins the namespace/policy pair every guide reads |
+| [lib/kopia.sh](lib/kopia.sh) | `kopia_exec`, `kopia_pvcs`, `kopia_snapshots`, `kopia_ingest`, `kopia_histogram` |
+| [lib/exports.sh](lib/exports.sh) | `export_actions`, `export_table` — ExportActions with the `/details` byte counters |
+| [lib/datamover.sh](lib/datamover.sh) | `datamover_for_export` — per-export CPU/memory, own versus concurrent |
+| [lib/nodes.sh](lib/nodes.sh) | `node_snapshot`, `node_totals` — capacity and a usage sample |
 | [lib/provenance.sh](lib/provenance.sh) | `audit_record`, `audit_redaction_check` |
 | [lint-paste-safety.py](lint-paste-safety.py) | checks guide code blocks survive a paste into zsh |
 | [generate-export-topology.py](generate-export-topology.py) | the automated sweep: whole export topology as JSON |
@@ -329,29 +355,34 @@ Then:
    audit requires (§8), and produces this guide's deliverable: `audit_record` writes the
    provenance record so every later figure can be read against the cluster state, K10
    version and metrics window it was taken from.
-2. Work through guides 01–13 in order.
+2. Pin a pair with `audit_focus`, then work through guides 01–13 in order
+   (12 before 04, 05, 06 and 11).
 3. Guides 04, 05, 06, 11 and 12 create short-lived pods; everything they do is
    read-only with respect to your data.
-4. Guides 09 and 13 run backup policies and need a maintenance window.
+4. Guide 09 reads retained metrics, so it needs no test run; guide 09 step 6 and
+   guide 13 step 7 do trigger a policy and need a maintenance window.
 
 ## Guide index
 
 | # | Guide | Data point | Impact on cluster |
 |---|-------|-----------|-------------------|
 | 00 | [Prerequisites](guides/00-prerequisites.md) | Tooling, access, effective metrics window, redaction | none |
-| 01 | [Namespaces in scope](guides/01-protected-namespaces.md) | Which namespaces have an export action, and its cadence | read-only |
-| 02 | [Policy frequency](guides/02-policy-frequency.md) | Schedule, retention, actions, export targets | read-only |
-| 03 | [PVCs per namespace](guides/03-pvc-per-namespace.md) | PVC count and provisioned size per namespace | read-only |
-| 04 | [Files per PVC](guides/04-files-per-pvc.md) | File count per PVC | read-only |
-| 05 | [Average file size per PVC](guides/05-average-file-size-per-pvc.md) | Mean file size per PVC | read-only |
-| 06 | [Change rate](guides/06-change-rate.md) | Bytes ingested per backup cycle | read-only |
-| 07 | [Node CPU and RAM](guides/07-node-cpu-memory.md) | Node capacity, allocatable, real headroom | read-only |
-| 08 | [Node disk and ephemeral storage](guides/08-node-disk-ephemeral-storage.md) | Free disk and ephemeral-storage pressure per node | read-only |
-| 09 | [Datamover CPU and RAM](guides/09-datamover-cpu-memory.md) | Actual datamover consumption, with PVC attribution | runs a policy; needs a window |
+| 01 | [Scope](guides/01-protected-namespaces.md) | Which (namespace, policy) pair, and why that one | read-only |
+| 02 | [Policy cadence](guides/02-policy-frequency.md) | Its three cadences, retention, fan-out, what it competes with | read-only |
+| 03 | [PVCs in the namespace](guides/03-pvc-per-namespace.md) | PVC count, size, class, volume mode | read-only |
+| 04 | [Files per PVC](guides/04-files-per-pvc.md) | File count per PVC, from the Kopia tree | read-only |
+| 05 | [File size distribution](guides/05-average-file-size-per-pvc.md) | Mean and histogram per PVC, from the repository | read-only |
+| 06 | [Change rate](guides/06-change-rate.md) | Physical ingest, files hashed, K10 transferred bytes | read-only |
+| 07 | [Node CPU and RAM](guides/07-node-cpu-memory.md) | Capacity, allocatable, real headroom | read-only |
+| 08 | [Node disk and ephemeral storage](guides/08-node-disk-ephemeral-storage.md) | Margin to eviction against worst-case datamover cache | read-only |
+| 09 | [Datamover CPU and RAM](guides/09-datamover-cpu-memory.md) | Per-export consumption, own versus concurrent | read-only on history |
 | 10 | [Datamover configuration](guides/10-datamover-helm-actionpodspec.md) | Helm values, `k10-config`, ActionPodSpec | read-only |
-| 11 | [Object store object count](guides/11-object-store-object-count.md) | Objects and bytes per repository prefix | read-only |
-| 12 | [Kopia repository diagnostics](guides/12-kopia-repository-diagnostics.md) | `repo-checker` inventory and diagnose bundles | read-only, spawns pods |
-| 13 | [Slow exports and restores](guides/13-slow-exports-and-restores.md) | Job durations, outliers, OOM-killed datamovers | reads history; test policies need a window |
+| 11 | [Object store object count](guides/11-object-store-object-count.md) | Objects and bytes for this repository prefix | read-only |
+| 12 | [Kopia repository diagnostics](guides/12-kopia-repository-diagnostics.md) | `repo_checker` inventory, diagnose, and the connection 04–06/11 need | read-only, spawns pods |
+| 13 | [Slow exports](guides/13-slow-exports-and-restores.md) | Duration next to bytes, queue time, OOM kills | reads history; test policies need a window |
+
+Order matters in one place: **guide 12 before 04, 05, 06 and 11** — it opens the
+read-only repository connection those four read from.
 
 ## Validation status
 
@@ -362,6 +393,13 @@ Every command in guides 00–13 was executed against a live OpenShift 4.18
 - storage backends: Azure Disk CSI (`managed-csi`), Azure File CSI, NFS CSI
 - object storage: in-cluster MinIO via an S3 `Location Profile`
 - OpenShift cluster monitoring (Thanos Querier + cAdvisor) enabled
+
+Guides 00–13 were then re-validated in their focused form against an OpenShift 4.18 /
+K10 9.0.5 cluster on the pair `prod-test` / `calibrate-backup` (a 100,003-file,
+51.2 GB volume with a known 20 % rewrite between cycles) and, for block mode, against
+`large-test-block` / `calibrate-backup-block`. The guide helpers were checked
+field-by-field against `generate-export-topology.py` on the same pair and produce
+identical figures.
 
 Where a command could not be fully exercised on that cluster, the guide says so
 explicitly under **Validation status**.

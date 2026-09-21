@@ -1,6 +1,6 @@
 # 08 — Node disk and ephemeral storage
 
-## What Global Engineering needs
+## What auditors need
 
 Per node: free space on the kubelet root filesystem and the image filesystem, the
 declared `ephemeral-storage` capacity and allocatable, and how much of it pods are
@@ -38,80 +38,73 @@ evicts pods, and BestEffort pods go first — which is exactly what the datamove
 So this guide is not bookkeeping. It is the check for the most common cause of
 "the backup failed and took some application pods with it".
 
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
-
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/08-node-disk" && cd "$AUDIT_DIR/08-node-disk"
+. lib/init.sh
+focus_dir 08-node-disk
 ```
 
-### Step 1 — declared ephemeral-storage capacity and allocatable
+### Step 1 — capacity and current usage per node
 
 ```bash
-kubectl get nodes -o json > nodes-raw.json
-
-jq -r '(["NODE","EPH_CAP_GiB","EPH_ALLOC_GiB","RESERVED_GiB"]|@tsv),
-       (.items[]
-        | ((.status.capacity["ephemeral-storage"]    | rtrimstr("Ki") | tonumber) * 1024) as $cap
-        | (.status.allocatable["ephemeral-storage"] | tonumber)                        as $alloc
-        | [ .metadata.name,
-            ($cap/1073741824*100|round/100),
-            ($alloc/1073741824*100|round/100),
-            (($cap-$alloc)/1073741824*100|round/100) ] | @tsv)' nodes-raw.json \
-  | tee ephemeral-capacity.tsv | column -t
+node_snapshot | tee node-snapshot.tsv | column -t
+node_totals   | tee node-totals.txt
 ```
 
-> **Unit trap**: on OpenShift 4.18, `capacity["ephemeral-storage"]` is expressed in
-> `Ki` (`"536083696Ki"`) while `allocatable["ephemeral-storage"]` is a bare byte count
-> (`"492980991592"`). The `jq` above handles both. If you write your own, check the
-> suffix — treating them as the same unit gives a 1024× error.
+The `EPH_CAP_GiB` / `EPH_USED_GiB` / `EPH_PCT` columns are this guide's subject:
+`node.fs` from the kubelet summary API, which is the filesystem the eviction manager
+itself watches. Validated:
 
-### Step 2 — real filesystem usage, straight from each kubelet
+```
+NODE      ROLES   EPH_CAP_GiB  EPH_USED_GiB  EPH_PCT  PRESSURE
+worker-4  worker  511.25       424.95        83.1     -
+worker-1  worker  511.25       167.44        32.8     -
+worker-5  worker  511.25       135.46        26.5     -
+worker-6  worker  511.25       104.03        20.3     -
+worker-3  worker  511.25       91.69         17.9     -
+worker-2  worker  511.25       114.23        22.3     -
+```
 
-The kubelet summary API is the authoritative source: it is what the eviction manager
-itself reads.
+**One worker at 83.1 % against a cluster median of 26 %.** With a default eviction
+threshold of `nodefs.available < 10%`, that node has 35 GiB of margin — and ten
+concurrent datamovers at 3 GB of Kopia cache each would eat most of it. That is the
+finding this guide exists to produce; step 4 turns it into an exact number.
+
+> **Unit trap.** `status.capacity["ephemeral-storage"]` is a `Ki` quantity
+> (`"536083696Ki"`) while `status.allocatable["ephemeral-storage"]` is a bare byte
+> count (`"492980991592"`). Treating them as the same unit gives a 1024× error.
+> `node_snapshot` parses quantities; `EPH_CAP_GiB` prefers the kubelet's own
+> `fs.capacityBytes` where it is available.
+
+### Step 2 — inodes and the image filesystem
+
+Inode exhaustion causes the same symptom as space exhaustion, and on most OpenShift
+layouts `nodefs` and `imagefs` are the **same device** — image pulls and datamover
+caches compete for one pool.
 
 ```bash
 for n in $(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
   kubectl get --raw "/api/v1/nodes/$n/proxy/stats/summary" \
     | jq -r --arg node "$n" '
         [ $node,
-          ((.node.fs.capacityBytes  // 0)/1073741824*100|round/100),
-          ((.node.fs.usedBytes      // 0)/1073741824*100|round/100),
-          ((.node.fs.availableBytes // 0)/1073741824*100|round/100),
-          (if (.node.fs.capacityBytes // 0) > 0
-             then ((.node.fs.usedBytes / .node.fs.capacityBytes)*1000|round/10) else 0 end),
           (.node.fs.inodes // 0), (.node.fs.inodesUsed // 0), (.node.fs.inodesFree // 0),
-          ((.node.runtime.imageFs.usedBytes // 0)/1073741824*100|round/100)
+          (if (.node.fs.inodes // 0) > 0
+             then ((.node.fs.inodesUsed / .node.fs.inodes)*1000|round/10) else 0 end),
+          ((.node.runtime.imageFs.usedBytes // 0)/1073741824*100|round/100),
+          ((.node.runtime.imageFs.capacityBytes // 0)/1073741824*100|round/100)
         ] | @tsv'
-done | { printf 'NODE\tFS_CAP_GiB\tFS_USED_GiB\tFS_AVAIL_GiB\tFS_USED_PCT\tINODES\tINODES_USED\tINODES_FREE\tIMAGEFS_USED_GiB\n'; cat; } \
-  | tee node-fs.tsv | column -t
+done | { printf 'NODE\tINODES\tINODES_USED\tINODES_FREE\tINODES_PCT\tIMAGEFS_USED_GiB\tIMAGEFS_CAP_GiB\n'; cat; } \
+  | tee node-inodes.tsv | column -t
 ```
 
-Validated sample from one worker:
+If `IMAGEFS_CAP_GiB` equals `EPH_CAP_GiB` from step 1, they are the same filesystem —
+do **not** add their usage together.
 
-```
-FS_CAP_GiB   511.25
-FS_USED_GiB  158.93
-FS_AVAIL_GiB 352.32
-FS_USED_PCT  31.1
-INODES       268172736
-INODES_USED  2427698
-```
-
-Note that on this cluster `nodefs` and `imagefs` are the **same filesystem**
-(`/dev/sdd4`, identical capacity and inode figures). That is the common OpenShift
-layout and it means image pulls and datamover caches compete for the same space.
+Inode exhaustion is not hypothetical here: the 5 M-file calibration volume in this
+cluster hit 100 % inodes on a 74 GiB ext4 (4,849,664 inodes at the default 16 KiB
+bytes-per-inode ratio) while blocks were only 77 % full, and the pod crash-looped
+(guide 06 step 4).
 
 ### Step 3 — per-pod ephemeral-storage consumption
 
@@ -129,8 +122,14 @@ done | sort -t"$(printf '\t')" -k4 -rn \
   | tee pod-ephemeral-usage.tsv | head -30 | column -t
 ```
 
-Run this **during** a backup window and the datamover pods will be at the top of the
-list. Outside the window they do not exist.
+Run this **during** an export and the datamover pods are at the top of the list.
+Outside the window they do not exist at all — which is why guide 09 step 6 has a
+capture loop rather than a single command. Filter to them:
+
+```bash
+awk -F'\t' -v ns="$K10NS" 'NR==1 || ($2==ns && $3 ~ /data-mover|copy-vol-data|create-repo|repository-server/)' \
+    pod-ephemeral-usage.tsv | column -t
+```
 
 From cluster monitoring, the closest equivalent covers the container writable layer
 only (not `emptyDir`), so prefer the kubelet API above:
@@ -158,9 +157,46 @@ for n in $(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"
 done | tee kubelet-eviction-effective.txt
 ```
 
-Defaults are `nodefs.available < 10%` and `imagefs.available < 15%`. Compare against
-`FS_AVAIL_GiB` from step 2 and compute the margin in GiB, then compare that margin
-against `k10DataStoreTotalCacheSizeLimitMB × concurrent exports`.
+Defaults are `nodefs.available < 10%` and `imagefs.available < 15%`.
+
+Turn that into the number that matters — margin to eviction, against what the
+datamovers can ask for:
+
+```bash
+CACHE_MB=$(kubectl -n "$K10NS" get cm k10-config \
+             -o jsonpath='{.data.k10DataStoreTotalCacheSizeLimitMB}')
+LIMIT=$(kubectl -n "$K10NS" get cm k10-config \
+          -o jsonpath='{.data.K10LimiterSnapshotExportsPerCluster}')
+echo "per-pod cache ceiling: ${CACHE_MB} MB   concurrent exports: ${LIMIT}"
+
+awk -F'\t' -v c="$CACHE_MB" -v l="$LIMIT" '
+  NR==1 {print "NODE\tEPH_CAP_GiB\tEPH_USED_GiB\tMARGIN_TO_10PCT_GiB\tWORST_CASE_CACHE_GiB\tVERDICT"; next}
+  $10=="-" || $11=="-" {next}
+  { margin = $10*0.9 - $11; worst = c*l/1024
+    printf "%s\t%s\t%s\t%.1f\t%.1f\t%s\n", $1, $10, $11, margin, worst,
+           (margin < worst ? "AT RISK" : "ok") }' node-snapshot.tsv \
+  | tee eviction-margin.tsv | column -t
+```
+
+Validated, with `k10DataStoreTotalCacheSizeLimitMB=3000` and
+`K10LimiterSnapshotExportsPerCluster=10` — a 29.3 GiB worst case:
+
+```
+NODE      EPH_CAP_GiB  EPH_USED_GiB  MARGIN_TO_10PCT_GiB  WORST_CASE_CACHE_GiB  VERDICT
+worker-4  511.25       421.84        38.3                 29.3                  ok
+worker-1  511.25       165.18        294.9                29.3                  ok
+master-1  462.94       386.35        30.3                 29.3                  ok
+```
+
+The busiest worker clears the worst case by 9 GiB and `master-1` by **1 GiB** — `ok`,
+but only just, and the margin moves every time an image is pulled. On a node with a
+200 GiB root disk rather than 511 GiB the same ten datamovers cross the threshold, and
+because they are BestEffort they are also the first pods the kubelet evicts.
+
+Two reasons this is a floor, not a ceiling: the cache limit is **per pod**, and the
+buffer file gets `K10BackupBufferFileHeadroomFactor` (1.1) and
+`K10EphemeralPVCOverhead` (0.1) on top. Masters are usually tainted, so read their rows
+only if step 5 of guide 07 shows a matching toleration.
 
 ### Step 5 — historical disk pressure and past evictions
 
@@ -221,24 +257,27 @@ kubectl get pods -A --field-selector status.phase=Failed -o json \
 
 ## Validation status
 
-Steps 1–3 and 5 fully validated on the validation cluster. Confirmed there: the
-`Ki`-vs-bytes unit mismatch between `capacity` and `allocatable`
-(`536083696Ki` vs `492980991592`); `nodefs` and `imagefs` reporting identical figures;
-`ephemeral_storage_pod_usage_bytes` absent from OpenShift monitoring while the kubelet
-summary API returned per-pod `ephemeral-storage` for every pod;
-`node_filesystem_avail_bytes` present with 119 series; and datamover pods created with
-`resources: {}` — no ephemeral-storage request or limit.
+Steps 1–5 fully validated on K10 9.0.5 / OpenShift 4.18.
 
-Step 5 was re-validated using the derived window from guide 00 §6
-(`AUDIT_WINDOW_DAYS=15`): the range query returned per-node minima (45.7 GiB on the
-masters) and the `['"$AUDIT_RANGE"']` interpolation returned 9 `DiskPressure` series.
+Step 1 returned `stats/summary` for all 9 nodes and surfaced a real imbalance: one
+worker at **83.1 %** ephemeral-storage use against a cluster median of 26 %. Step 4's
+margin calculation put it at 38.3 GiB of headroom against a 29.3 GiB worst case
+(`k10DataStoreTotalCacheSizeLimitMB` 3000 × `K10LimiterSnapshotExportsPerCluster` 10),
+and `master-1` at 30.3 GiB against the same 29.3 GiB — a 1 GiB margin.
 
-Step 4 validated: `/proxy/configz` returned the effective thresholds
-(`nodefs.available: 10%`, `imagefs.available: 15%`, `nodefs.inodesFree: 5%`,
-`imageGCHighThresholdPercent: 85`). Note that the `kubeletconfig` CRD lookup returns
-nothing on a cluster that has never customised kubelet settings — `configz` is the
-reliable source, not the CRD.
+Also confirmed here: the `Ki`-versus-bytes unit mismatch between `capacity` and
+`allocatable`; `nodefs` and `imagefs` reporting identical figures, i.e. the same
+device; `ephemeral_storage_pod_usage_bytes` absent from OpenShift monitoring while the
+kubelet summary API returns per-pod `ephemeral-storage`; `/proxy/configz` returning the
+effective thresholds (`nodefs.available: 10%`, `imagefs.available: 15%`,
+`nodefs.inodesFree: 5%`, `imageGCHighThresholdPercent: 85`); and datamover pods created
+with `resources: {}`.
 
-On that worker the margin to eviction was 352 GiB against a 10 % (51 GiB) threshold, so
-there was ample room. On a node with a smaller root disk, ten concurrent datamovers at
-3 GB cache each is a realistic way to cross it.
+Note that the `kubeletconfig` CRD lookup returns nothing on a cluster that has never
+customised kubelet settings — `configz` is the reliable source, not the CRD.
+
+Inode exhaustion (step 2) was observed for real on this cluster, on the 5 M-file
+calibration volume: 100 % inodes at 77 % blocks, and a crash-looping pod. What was
+**not** reproduced is an actual eviction: no node crossed its threshold during the
+audit, so `evicted-pods.tsv` was empty and the eviction path itself is reasoned from
+the thresholds rather than observed.

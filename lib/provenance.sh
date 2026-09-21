@@ -75,6 +75,12 @@ audit_record() {
     echo "policy_count         : $(kubectl -n "${K10NS:-kasten-io}" get policies.config.kio.kasten.io --no-headers 2>/dev/null | wc -l | tr -d ' ')"
     echo "profile_count        : $(kubectl -n "${K10NS:-kasten-io}" get profiles --no-headers 2>/dev/null | wc -l | tr -d ' ')"
     echo
+    echo "-- audit focus ----------------------------------------------------"
+    echo "AUDIT_NS             : ${AUDIT_NS:-NOT SET}"
+    echo "AUDIT_POLICY         : ${AUDIT_POLICY:-NOT SET}"
+    echo "AUDIT_PROFILE        : ${AUDIT_PROFILE:-NOT SET}"
+    echo "(guides 01-13 collect this pair only; see guide 00 section 10)"
+    echo
     echo "-- metrics window -------------------------------------------------"
     echo "AUDIT_WINDOW_DAYS    : ${AUDIT_WINDOW_DAYS:-NOT SET}"
     echo "AUDIT_RANGE          : ${AUDIT_RANGE:-NOT SET}"
@@ -104,6 +110,9 @@ audit_record() {
 export K10NS="${K10NS:-kasten-io}"
 export AUDIT_DIR="$AUDIT_DIR"
 export CLUSTER_UID="${CLUSTER_UID:-}"
+export AUDIT_NS="${AUDIT_NS:-}"
+export AUDIT_POLICY="${AUDIT_POLICY:-}"
+export AUDIT_PROFILE="${AUDIT_PROFILE:-}"
 export AUDIT_WINDOW_DAYS="${AUDIT_WINDOW_DAYS:-}"
 export AUDIT_RANGE="${AUDIT_RANGE:-}"
 export AUDIT_START="${AUDIT_START:-}"

@@ -1,208 +1,206 @@
-# 05 — Average file size per PVC
+# 05 — File size distribution per PVC
 
-## What Global Engineering needs
+## What auditors need
 
-The mean file size of each PVC, and ideally the size *distribution*. Combined with the
-file count from guide 04 this predicts the shape of the Kopia workload:
+The mean file size of each PVC in `$AUDIT_NS`, and — more importantly — the size
+*distribution*. Combined with the file count from guide 04 this predicts the shape of
+the Kopia workload:
 
-- **Many small files** (mean < 64 KiB): the backup is metadata-bound. Runtime scales
-  with file count, the Kopia index grows fast, and datamover memory is driven by the
-  in-flight directory tree rather than by data volume.
-- **Few large files** (mean > 16 MiB): the backup is throughput-bound. Runtime scales
-  with bytes and network, and the dominant tuning knobs are
-  `k10DataStoreParallelUpload` and the pack size.
+- **Many small files** (mean < 64 KiB): metadata-bound. Runtime scales with file count,
+  the Kopia index grows fast, and datamover memory is driven by the in-flight directory
+  tree rather than by data volume.
+- **Few large files** (mean > 16 MiB): throughput-bound. Runtime scales with bytes and
+  network, and the tuning knobs are `k10DataStoreParallelUpload` and the pack size.
 
-The mean alone is a weak statistic — a volume with one 14 GiB file and a million 1 KiB
-files has a "reasonable" mean and pathological behaviour. Collect the histogram where
-you can.
-
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
+**The mean alone is a weak statistic.** A volume with one 14 GiB file and a million
+1 KiB files has a reasonable mean and pathological behaviour. Get the histogram — and
+since guide 12 leaves you connected to the repository, it costs one read.
 
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/05-avg-file-size" && cd "$AUDIT_DIR/05-avg-file-size"
+. lib/init.sh
+focus_dir 05-file-size
 ```
 
-### Step A — preferred: derive it from the Kopia snapshot stats
+Reuses `kopia-snapshots.json` from guide 04 step 1.
 
-Exact, zero impact on the application namespace, works on NFS and block alike. Reuses
-`kopia-snapshots.json` from guide 04 step C.
+### Step 1 — the mean, from the snapshot tree
 
 ```bash
-jq -r '(["PVC","FILES","TOTAL_BYTES","AVG_FILE_BYTES","AVG_HUMAN"]|@tsv),
-       (.[] | . as $s
-        | ($s.stats.fileCount) as $n | ($s.stats.totalFileSize) as $b
-        | [ ($s.source.host | split(".") | last),
-            $n, $b,
-            (if $n > 0 then ($b/$n|round) else 0 end),
-            (if $n > 0 then
-               ($b/$n) as $a
-               | if   $a < 1024        then "\($a|round) B"
-                 elif $a < 1048576     then "\(($a/1024*10|round)/10) KiB"
-                 elif $a < 1073741824  then "\(($a/1048576*10|round)/10) MiB"
-                 else "\(($a/1073741824*100|round)/100) GiB" end
-             else "-" end) ] | @tsv)' \
-   "$AUDIT_DIR/04-files-per-pvc/kopia-snapshots.json" \
-  | tee avg-file-size-from-kopia.tsv \
-  | column -t -s "$(printf '\t')"
+cp "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/04-files-per-pvc/kopia-snapshots.json" .
+kopia_pvcs | tee mean-file-size.tsv | column -t
 ```
 
-`kopia snapshot list --all` returns **every** snapshot, so a PVC backed up 30 times
-appears 30 times. Keep only the most recent per PVC:
+Validated:
+
+```
+PVC                   MODE        SNAPSHOTS  LAST_SNAPSHOT        FILES   SIZE_BYTES   AVG_FILE_BYTES  DIRS
+calibrate-100k-500kb  filesystem  5          2026-09-20T08:01:37  100003  51200000058  511984          2
+```
+
+`AVG_FILE_BYTES` is `rootEntry.summ.fileSize / rootEntry.summ.files` — the tree, not
+the run. Dividing by `stats.fileCount` instead is the trap guide 04 documents: on this
+PVC it would give 2.56 MB on one snapshot and a division by zero on the next, for a
+volume whose true mean never moves off 512 KB.
+
+### Step 2 — the histogram, from the repository
+
+Two commands. No access to the application namespace, no second walk of the volume.
 
 ```bash
-jq -r 'group_by(.source.host)
-       | map(sort_by(.startTime) | last)
-       | (["PVC","SNAPSHOT_TIME","FILES","TOTAL_BYTES","AVG_FILE_BYTES"]|@tsv),
-         (.[] | [ (.source.host|split(".")|last), .startTime,
-                  .stats.fileCount, .stats.totalFileSize,
-                  (if .stats.fileCount > 0 then (.stats.totalFileSize/.stats.fileCount|round) else 0 end) ]|@tsv)' \
-   "$AUDIT_DIR/04-files-per-pvc/kopia-snapshots.json" \
-  | tee avg-file-size-latest.tsv | column -t -s "$(printf '\t')"
+ROOT=$(awk -F'\t' 'NR==2 {print $9}' "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/04-files-per-pvc/files-per-pvc.tsv")
+kopia_exec "kopia ls -l -r $ROOT" > tree-listing.txt
+kopia_histogram tree-listing.txt | tee histogram.tsv | column -t
 ```
 
-Validated output from the validation cluster, after two backup cycles with 5 MiB of new
-data written between them:
+`kopia ls -l -r <rootObjectId>` enumerates exactly `summ.files` regular files, one per
+line:
 
 ```
-PVC                                FILES  TOTAL_BYTES  AVG_FILE_BYTES  AVG_HUMAN
-basic-app-pvc                      1      2726         2726            2.7 KiB
-basic-app-pvc                      1      2726         2726            2.7 KiB
-basic-app-pvc-2026-07-21-08-24-17  1      14068509     14068509        13.4 MiB
-basic-app-pvc-2026-07-21-08-24-17  3      19313245     6437748         6.1 MiB
+-rw-r--r--       512000 2026-09-20 04:07:44 UTC 3281cda877b9226da4bca1b84ac1be28   17390.v1.bin
 ```
 
-Note how the mean for the second PVC *dropped* from 13.4 MiB to 6.1 MiB simply because
-two smaller files were added. The mean is a moving target; that is the point of also
-collecting the histogram.
+Validated:
 
-### Step B — for PVCs with no restore point: the scan already has it
+```
+BUCKET        FILES   BYTES        PCT_FILES
+<4KiB         3       58           0.0
+4KiB-64KiB    0       0            0.0
+64KiB-1MiB    100000  51200000000  100.0
+1MiB-16MiB    0       0            0.0
+16MiB-256MiB  0       0            0.0
+>256MiB       0       0            0.0
+TOTAL         100003  51200000058  100.0
+min=0 max=512000 mean=511984
+```
 
-`pvc_scan_network` (guide 04 step B) computes the mean as it walks, so there is nothing
-extra to run — `AVG_FILE_BYTES` is `USED_KIB * 1024 / FILES`:
+`TOTAL` must match `FILES` and `SIZE_BYTES` from step 1 — it does here, exactly. If it
+does not, the root object id belongs to a different snapshot.
+
+This distribution is unimodal at 512 KB, so the mean is honest for once. Read
+`min=0 max=512000` next to it: that is the check on whether the mean means anything.
+
+For a very large tree the listing is large (100,003 files ≈ 8 MB). The generator skips
+the histogram above `--histogram-max-files` (2 M by default) for the same reason; do
+the same by hand if `FILES` is in the millions.
+
+### Step 3 — for several PVCs
 
 ```bash
-awk -F'\t' 'NR==1 || $6 > 0 { print $1"/"$2"\t"$6"\t"$9"\t"$10 }' \
-    "$AUDIT_DIR/04-files-per-pvc/network-pvc-scan.tsv" \
-  | { printf 'PVC\tFILES\tUSED_KIB\tAVG_FILE_BYTES\n'; tail -n +2; } \
-  | column -t -s "$(printf '\t')"
+awk -F'\t' 'NR>1 && $2!="block" {print $1"\t"$9}' \
+    "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/04-files-per-pvc/files-per-pvc.tsv" \
+  | while IFS="$(printf '\t')" read -r pvc root; do
+      kopia_exec "kopia ls -l -r $root" > "tree-$pvc.txt"
+      printf '=== %s ===\n' "$pvc"
+      kopia_histogram "tree-$pvc.txt" | column -t
+    done | tee histograms-all.txt
 ```
 
-Validated output:
+The `$2!="block"` filter is deliberate — see step 4.
+
+### Step 4 — block-mode volumes have no file sizes
+
+A KubeVirt VM disk is stored as fixed-size chunks. Every chunk is the same size, so a
+histogram over them is a single bar that tells you nothing about the guest filesystem
+inside. Report the logical size and the block size instead, both from guide 04 step 5:
 
 ```
-PVC                                 FILES  USED_KIB  AVG_FILE_BYTES
-basic-app/basic-app-pvc             1      8         8192
-cpd/cc-home-pvc                     574    15028     26810
-cpd/file-api-claim                  494    20872     43265
-cpd/volumes-datarefinerylibvol-pvc  14498  1066728   75343
-cpd/ws-runtimes-libs-pvc            225    385632    1755054
+calibrate-5000k-10kb  block  71028 chunks  74478256128 bytes  BlockSzB 0x100000 = 1 MiB
 ```
 
-The spread is the point: 26 KiB on one volume and 1.75 MiB on another, in the same
-namespace. `ws-runtimes-libs-pvc` is throughput-bound and
-`volumes-datarefinerylibvol-pvc`, with 14 498 files, is metadata-bound — they need
-opposite tuning.
+An **empty** VM disk is a real and confusing case: a blank DataVolume exports as a
+block snapshot with 0 chunks and `summ.fileSize` 0 although the PVC requests
+gigabytes. That is correct data — render it as "empty disk", not as `0 B` of a
+74 GiB volume.
 
-> **`du` measures allocation, `stat` measures size.** `AVG_FILE_BYTES` is derived from
-> `du`, so on a volume full of files smaller than the block size it is inflated — a
-> million 100-byte files on a 4 KiB-block filesystem average out at 4 096, a 40× error
-> in the direction that hides the problem. When the mean lands suspiciously close to the
-> block size, get the histogram instead (step C).
+### Step 5 — Kopia's own content-block distribution
 
-### Step C — the size histogram
+Not a file histogram, but free, and it answers a different question: how well the data
+compresses, which is a direct input to the `k10DataStoreDisableCompression`
+recommendation.
 
-Much more informative than the mean, and the scanner will produce it on request:
+```bash
+kopia_exec 'kopia content stats' | tee content-stats.txt
+kopia_exec 'kopia blob stats'    | tee blob-stats.txt
+```
+
+Validated `blob stats`:
+
+```
+Count: 3452
+Total: 71.7 GB
+Average: 20.8 MB
+Histogram:
+        2 between 10 B and 100 B (total 48 B)
+       11 between 100 B and 1 KB (total 3.3 KB)
+       16 between 1 KB and 10 KB (total 53.6 KB)
+        3 between 100 KB and 1 MB (total 1.9 MB)
+        5 between 1 MB and 10 MB (total 16.1 MB)
+     3415 between 10 MB and 100 MB (total 71.7 GB)
+```
+
+3,415 of 3,452 blobs sit in the 10–100 MB bucket against a 20 MB max pack size — packs
+are being filled properly. The opposite shape (most blobs under 10 KB) means Kopia is
+flushing before packs fill, which multiplies object count and maintenance cost;
+guide 11 reads the same file for the object-count argument.
+
+### Step 6 — fallback: PVCs never exported
+
+`pvc_scan_network` (guide 04 step 6) computes the mean as it walks, and will produce a
+histogram on request:
 
 ```bash
 export PVCSCAN_HISTOGRAM=1
-export PVCSCAN_HIST_FILE="$AUDIT_DIR/05-avg-file-size/histograms.tsv"
+export PVCSCAN_HIST_FILE="$PWD/histograms-live.tsv"
 : > "$PVCSCAN_HIST_FILE"
-
-pvc_scan_network > /dev/null 2> hist-scan.log
+pvc_scan_network "$AUDIT_NS" > /dev/null 2> hist-scan.log
 column -t -s "$(printf '\t')" "$PVCSCAN_HIST_FILE"
 ```
 
-Buckets are `<4KiB`, `4KiB-64KiB`, `64KiB-1MiB`, `1MiB-16MiB`, `16MiB-256MiB`,
-`>256MiB`. The walk is done with `find -exec stat -c '%s' {} +` rather than
-`find -printf`, because BusyBox — which many application images use — does not implement
-`-printf`.
+Same buckets as `kopia_histogram`, so the two are comparable. The walk uses
+`find -exec stat -c '%s' {} +` rather than `find -printf`, because BusyBox — which many
+application images use — does not implement `-printf`.
 
-This is a second full walk, so run it only for the volumes that matter:
-
-```bash
-pvc_scan_one cpd volumes-datarefinerylibvol-pvc > /dev/null
-```
-
-### Step D — repository-wide size distribution, for free
-
-Kopia already computes a histogram of the *content blocks* it stores. It is not a file
-histogram, but it is a good proxy for whether the workload is small-file or large-file
-shaped, and it costs nothing. From the guide 12 diagnose bundle:
-
-```bash
-cat "$AUDIT_DIR/12-kopia/"*/kopia-debug-logs/content-stats-stdout.txt
-cat "$AUDIT_DIR/12-kopia/"*/kopia-debug-logs/blob-stats-stdout.txt
-```
-
-Validated output:
-
-```
-Count: 12
-Total Bytes: 14.1 MB
-Total Packed: 2.8 MB (compression 80.0%)
-By Method:
-  (uncompressed)         count: 5 size: 2.6 KB
-  s2-default             count: 4 size: 14.1 MB packed: 2.8 MB compression: 80.0%
-  zstd-fastest           count: 3 size: 888 B packed: 712 B compression: 19.8%
-Average: 1.2 MB
-```
-
-The compression ratio in that output is itself a recommendation input — 80 % on this
-dataset means `k10DataStoreDisableCompression` should stay at its default.
+> **`du` measures allocation, `stat` measures size.** The live scan's mean is derived
+> from `du`, so on a volume full of files smaller than the block size it is inflated: a
+> million 100-byte files on a 4 KiB-block filesystem average out at 4,096, a 40× error
+> in the direction that hides the problem. The Kopia-derived mean in step 1 has no such
+> bias — another reason to prefer it.
 
 ## Caveats
 
-- **`du` measures allocation, `stat` measures size.** On a volume with a 4 KiB block
-  size and a million 100-byte files, `du`-derived mean is 4 096 B and the true mean is
-  100 B — a 40× error in the direction that hides the problem. When the mean from step
-  B lands suspiciously close to the filesystem block size, switch to step C.
-- **The mean hides bimodality.** Always report the histogram if you have it, and say
-  so explicitly when you only have the mean.
-- **Sparse files** (common in VM-image volumes) report a large `stat` size and small
-  `du` size. For KubeVirt/CNV volumes, `du` is the honest number for backup sizing.
-- **Kopia's `totalFileSize` excludes directories and symlinks.** Guide 04's
-  `dirCount` covers those; do not add them into the size denominator.
-- **Block-mode volumes have no file sizes.** VM disks are stored as fixed-size chunks
-  (guide 04 step C); a mean or histogram over them is meaningless — report the logical
-  size from `rootEntry.summ.fileSize` and the block size, nothing else.
-- Compressed or deduplicated backends (ZFS, VDO, some CSI drivers) make `du` report
-  post-compression allocation. Note the backend alongside the figure.
+- **The mean hides bimodality.** Always send the histogram if you have it, and say so
+  explicitly when you only have the mean.
+- **`summ.fileSize` excludes directories and symlinks.** Guide 04's `DIRS` covers those;
+  do not add them into the size denominator.
+- **Sparse files** (common in VM-image volumes) report a large `stat` size and a small
+  `du` size. Kopia stores what it reads, so `summ.fileSize` is the honest number for
+  backup sizing.
+- **Compressed or deduplicated backends** (ZFS, VDO, some CSI drivers) make the live
+  `du` report post-compression allocation. Note the backend alongside any step 6 figure.
+- **The histogram is of the tree at the last snapshot**, not of the volume now.
 
 ## What to send back
 
 | File | Contents |
 |------|----------|
-| `avg-file-size-from-kopia.tsv` | mean file size per PVC, derived from backup stats (preferred) |
-| `histogram-<namespace>-<pvc>.txt` | size distribution per PVC, from step C |
-| `du-means.tsv` | step B output for PVCs with no restore point |
-| `content-stats-stdout.txt`, `blob-stats-stdout.txt` | Kopia's own block-size distribution and compression ratio |
+| `histogram.tsv` | size distribution per PVC, from the repository (headline) |
+| `mean-file-size.tsv` | mean file size per PVC |
+| `tree-listing.txt` | the raw `kopia ls -l -r` output the histogram is built from |
+| `blob-stats.txt`, `content-stats.txt` | Kopia's block-size distribution and compression ratio |
+| `histograms-live.tsv` | live-walk histogram, only for PVCs never exported |
 
 ## Validation status
 
-Fully validated on K10 9.0.5. The Kopia-derived mean (step A) was cross-checked against
-an in-pod `stat` walk of the same volume and matched. The BusyBox histogram in step C
-was executed successfully inside an application container whose only shell was
-`/bin/busybox`; note that `find -printf` failed there, which is why the guide uses
-`-exec stat -c` instead. Step D output is verbatim from the validation cluster's
-`content-stats-stdout.txt`.
+Fully validated on K10 9.0.5 against `prod-test` / `calibrate-backup`. The histogram
+from `kopia ls -l -r` totalled 100,003 files and 51,200,000,058 bytes — an exact match
+with `rootEntry.summ` and with `generate-export-topology.py`'s own `sizeHistogram`
+buckets for the same PVC, bucket for bucket.
+
+Step 5's output is verbatim from that repository. Step 4's figures come from
+`large-test-block` / `calibrate-backup-block`.
+
+The `du`-versus-`stat` bias and the BusyBox `-printf` failure in step 6 are carried
+over from an earlier validation cluster; step 6 itself was not re-run here, because
+every PVC of this pair has been exported and step 2 is strictly better.

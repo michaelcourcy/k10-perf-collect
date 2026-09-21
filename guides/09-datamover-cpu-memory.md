@@ -1,228 +1,145 @@
 # 09 — Datamover CPU and RAM consumption
 
-## What Global Engineering needs
+## What auditors need
 
-What the datamover pods actually consume in CPU, RSS and ephemeral storage, and — as far
-as possible — which PVC each figure belongs to.
+What the datamover pods of `$AUDIT_NS` actually consumed in CPU, RSS and ephemeral
+storage during its exports — and how much of the cluster's datamover load was
+*somebody else's*.
 
-## The cAdvisor attribution constraint, and how far it can be worked around
+## The attribution problem, and how far it can be solved
 
-The starting position was: cAdvisor is enabled by default on OpenShift, but it does not
-copy pod labels into its metrics, so only the pod name (`data-mover`) and the namespace
-(`kasten-io`) look available for attribution.
-
-That is correct. Confirmed on the validation cluster — the full label set on a cAdvisor
-series is:
+cAdvisor carries **no pod labels**. Confirmed: the full label set on a
+`container_memory_working_set_bytes` series is
 
 ```
 container, cpu, endpoint, id, image, instance, job, metrics_path, name,
 namespace, node, pod, prometheus, service
 ```
 
-No pod labels. **But `pod` is there, and that is enough**, because K10 puts the
-attribution into the pod's *labels*, which can be captured while the pod still exists
-and then joined on `pod` afterwards. Verified label sets:
+So a series says "some pod in `kasten-io`", never "the export of `prod-test`".
+
+**But `pod` is there, and that is enough.** kube-state-metrics publishes pod labels as
+`label_*` on `kube_pod_labels`, and K10 labels its worker pods with the attribution:
+
+| Pod | Labels it carries |
+|---|---|
+| `data-mover-svc-*` | `app-name` (the **application** namespace), `policy-name`, `k10.kasten.io/jobID` |
+| `copy-vol-data-*` | `k10.kasten.io/jobID` only |
+
+A `copy-vol-data` pod — the one actually reading the volume — inherits its namespace
+from the `data-mover-svc` pod of the **same job**. The join chain is:
 
 ```
-data-mover-svc-b6kr7   app-name=basic-app  policy-name=basic-app-backup
-                       k10.kasten.io/jobID=f09cab38-b107-11f1-bdad-0a580a8103a7
-                       service=data-mover-svc  createdBy=kanister
-
-copy-vol-data-259bj    k10.kasten.io/migrationOp=kopiaCopyVolumeData
-                       k10.kasten.io/jobID=f09cab38-b107-11f1-bdad-0a580a8103a7
-                       createdBy=Kasten-K10
+cAdvisor series (pod=...) → kube_pod_labels (label_app_name, label_k10_kasten_io_job_id) → namespace
 ```
 
-So the join chain is:
+This needs no capture loop and works on history. It replaces the live pod-watch that
+earlier versions of this guide relied on — that loop is still in step 5, for a
+controlled test run.
 
-```
-cAdvisor series (pod=...)  →  captured pod labels (app-name, policy-name, jobID)  →  namespace + policy
-```
-
-Per-**PVC** attribution is one step harder and only partly achievable — see
-[Per-PVC attribution](#per-pvc-attribution) below.
-
-## Three independent sources, in order of usefulness
-
-| Source | Granularity | Attribution | Survives pod deletion |
-|--------|------------|-------------|----------------------|
-| cAdvisor via Thanos | per container, 30 s samples | via captured labels | yes, in TSDB |
-| K10 worker-pod metric sidecar | per `podType` | `podType` only | in K10's Prometheus |
-| kubelet summary API | per pod, including `emptyDir` | pod name | no — poll live |
-
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
+**Per-PVC attribution is not achievable.** A `copy-vol-data` pod handles one volume and
+mounts an ephemeral `kanister-pvc-*` clone, not the source; the source PVC name is in
+neither its labels nor its spec. Take per-PVC *work* from Kopia (guides 04–06) and
+per-job *resources* from here.
 
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/09-datamover" && cd "$AUDIT_DIR/09-datamover"
+. lib/init.sh
+focus_dir 09-datamover
 ```
 
-### Step 1 — start the label capture loop *before* triggering the policy
-
-This is the part that makes the rest work. Datamover pods on the validation cluster
-lived **under 60 seconds**. If you start capturing after the run, there is nothing left
-to capture.
+### Step 1 — can anything be attributed at all?
 
 ```bash
-cat > capture-datamover-pods.sh <<'SH'
-#!/usr/bin/env bash
-# Poll kasten-io for worker pods and persist their spec + labels before they vanish.
-K10NS=${K10NS:-kasten-io}
-OUT=${1:-./dm-specs}
-DUR=${2:-1800}          # seconds to keep watching
-mkdir -p "$OUT"
-end=$(( $(date +%s) + DUR ))
-while [ "$(date +%s)" -lt "$end" ]; do
-  for p in $(kubectl -n "$K10NS" get pods -o name 2>/dev/null \
-             | grep -E 'data-mover|copy-vol-data|create-repo|repository-server|restore-data|check-repo'); do
-    n=$(basename "$p")
-    [ -f "$OUT/$n.json" ] || {
-      kubectl -n "$K10NS" get "$p" -o json > "$OUT/$n.json" 2>/dev/null && echo "captured $n"
-    }
-  done
-  sleep 2
-done
-SH
-chmod +x capture-datamover-pods.sh
-./capture-datamover-pods.sh ./dm-specs 1800 &
-CAPTURE_PID=$!
+ksm_pod_labels_check | tee ksm-check.txt
 ```
 
-A `kubectl get pods -w` watch is lighter but loses pods that appear and disappear
-between events under load; the 2-second poll above captured all 5 worker pods of a real
-run.
+Validated: `kube_pod_labels: pod labels ARE exposed (270 label_* keys) - attribution works`.
 
-### Step 2 — trigger the workload
+OpenShift runs kube-state-metrics with `--metric-labels-allowlist=pods=[*]`, so this
+works out of the box. On another Prometheus stack it will report **NO pod labels**, and
+then every figure below is per pod only. Say so in the report rather than attributing
+by guesswork; the fix is
+`--metric-labels-allowlist=pods=[app-name,policy-name,k10.kasten.io/jobID]` on
+kube-state-metrics.
+
+### Step 2 — usage for one of the pair's exports
 
 ```bash
-cat <<YAML | kubectl create -f -
-apiVersion: actions.kio.kasten.io/v1alpha1
-kind: RunAction
-metadata:
-  generateName: audit-run-
-  namespace: $K10NS
-spec:
-  subject:
-    kind: Policy
-    name: <POLICY_NAME>
-    namespace: $K10NS
-YAML
-
-# note the window — you need it for the range queries
-RUN_START=$(date +%s)
+export_actions | head -5 | column -t
+datamover_for_export scheduled-gn9w65njrc | tee datamover-usage.txt
 ```
 
-Wait for completion, then:
+Validated:
+
+```
+window            : 2026-09-20T08:00:07Z .. 2026-09-20T08:05:30Z (323s, includes 45s padding each side)
+namespace         : prod-test
+pods              : 3
+peak sum memory   : 742.96 MiB
+cpu total         : 107.239 cpu-s  (avg 0.33 cores over the window)
+concurrent        : kasten-io,large-test,test-calibrate
+all datamovers    : 961.32 MiB peak - the load the cluster actually carried
+
+POD                   APP_NS          POLICY            JOB_ID        SCOPE         PEAK_MEM_MiB  CPU_SECONDS
+copy-vol-data-2vsvp   prod-test       -                 665c3024-...  own           250.14        39.864
+copy-vol-data-d8vth   large-test      -                 6c99a162-...  concurrent    11.91         0
+copy-vol-data-gjcm8   test-calibrate  -                 66608f11-...  concurrent    0             no-sample
+create-repo-tgv7d     -               -                 -             unattributed  110.05        0
+data-mover-svc-hxjxk  test-calibrate  -                 66608f11-...  concurrent    115.18        0.001
+data-mover-svc-kl7dx  large-test      -                 6c99a162-...  concurrent    116.73        4.585
+data-mover-svc-n6lfg  prod-test       -                 665c3024-...  own           492.81        67.375
+data-mover-svc-wlzt4  kasten-io       calibrate-backup  5260458b-...  concurrent    129.62        1.501
+```
+
+Read it in three parts.
+
+**`own` versus `concurrent`.** `calibrate-backup` selects three namespaces (guide 01
+step 3), so one firing exports all three at once. Attributing all eight pods to
+`prod-test` would triple its apparent cost; reporting only its own hides what the
+cluster carried. Both numbers are printed: 743 MiB for this namespace, 961 MiB for
+everything. Size the nodes against the second, charge the namespace the first.
+
+**`peak sum memory` is not the sum of the peaks.** It is the maximum, over the window,
+of memory summed across the pods at each step — 743 MiB, against 250 + 493 + 110 = 853
+if you added the individual peaks of pods that never peaked together.
+
+**CPU is CPU-seconds, not a rate.** 107 cpu-s over a 323 s window is 0.33 cores on
+average. It comes from the cumulative counter `container_cpu_usage_seconds_total`, per
+pod `max − min` inside the window. A `rate()` needs several samples per pod, and these
+pods live seconds to minutes against a 15–30 s scrape interval, so a rate smooths a
+short pod towards zero or misses it entirely. The counter difference keeps every second
+that was sampled.
+
+`no-sample` is honest reporting: that pod lived less than one scrape interval and left
+nothing. **Every figure here is a floor for short exports.**
+
+### Step 3 — across every export of the pair
 
 ```bash
-kubectl -n "$K10NS" get exportactions,backupactions -A \
-  -o custom-columns='KIND:.kind,NAME:.metadata.name,STATE:.status.state,START:.status.startTime,END:.status.endTime' \
-  | tee action-windows.tsv
-
-RUN_END=$(date +%s)
-kill $CAPTURE_PID 2>/dev/null
+export_actions | awk -F'\t' 'NR>1 {print $1}' | while read -r a; do
+  printf '=== %s ===\n' "$a"
+  datamover_for_export "$a" | head -8
+done | tee datamover-all-exports.txt
 ```
 
-### Step 3 — build the pod → attribution map
+The number to extract is peak memory **per million files**, or per GiB moved: that is
+what sizes an `ActionPodSpec`. Cross-reference the window's `HASHED` count from guide
+04 step 3.
 
-```bash
-for f in dm-specs/*.json; do
-  jq -r '[ .metadata.name,
-           (.metadata.labels["app-name"]            // "-"),
-           (.metadata.labels["policy-name"]          // "-"),
-           (.metadata.labels["k10.kasten.io/jobID"]  // "-"),
-           (.metadata.labels["k10.kasten.io/migrationOp"] // "-"),
-           .spec.nodeName,
-           ([.spec.volumes[]? | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName] | join(",") ),
-           ([.spec.containers[].name] | join(",")),
-           ([.spec.containers[] | (.resources | tostring)] | join(" | "))
-         ] | @tsv' "$f"
-done | { printf 'POD\tAPP_NS\tPOLICY\tJOB_ID\tMIGRATION_OP\tNODE\tMOUNTED_PVC\tCONTAINERS\tRESOURCES\n'; cat; } \
-  | tee datamover-attribution.tsv | column -t -s "$(printf '\t')"
-```
+### Step 4 — K10's own worker-pod metric sidecar
 
-### Step 4 — cAdvisor: peak RSS and CPU seconds per datamover pod
-
-```bash
-# widen the window slightly — cAdvisor samples every 30 s
-S=$((RUN_START - 120)); E=$((RUN_END + 120))
-
-tqr 'max by (pod, container) (container_memory_working_set_bytes{namespace="'"$K10NS"'",pod=~"data-mover.*|copy-vol-data.*|create-repo.*|repository-server.*|restore-data.*",container!="",container!="POD"})' "$S" "$E" 15s \
-  | jq -r '(["POD","CONTAINER","PEAK_WS_MiB"]|@tsv),
-           (.data.result[] | [ .metric.pod, .metric.container,
-                ((.values|map(.[1]|tonumber)|max)/1048576*100|round/100) ] | @tsv)' \
-  | tee datamover-peak-memory.tsv | column -t
-
-tqr 'max by (pod, container) (container_cpu_usage_seconds_total{namespace="'"$K10NS"'",pod=~"data-mover.*|copy-vol-data.*|create-repo.*|repository-server.*|restore-data.*",container!="",container!="POD"})' "$S" "$E" 15s \
-  | jq -r '(["POD","CONTAINER","CPU_SECONDS"]|@tsv),
-           (.data.result[] | (.values|map(.[1]|tonumber)) as $v
-            | [ .metric.pod, .metric.container, (($v|max)-($v|min)|.*1000|round/1000) ] | @tsv)' \
-  | tee datamover-cpu-seconds.tsv | column -t
-```
-
-Then join with step 3 to get the namespace and policy:
-
-```bash
-join -t"$(printf '\t')" -1 1 -2 1 \
-  <(tail -n +2 datamover-peak-memory.tsv | sort -k1,1) \
-  <(tail -n +2 datamover-attribution.tsv | cut -f1,2,3,6 | sort -k1,1) \
-  | { printf 'POD\tCONTAINER\tPEAK_WS_MiB\tAPP_NS\tPOLICY\tNODE\n'; cat; } \
-  | tee datamover-usage-attributed.tsv | column -t -s "$(printf '\t')"
-```
-
-Container names to expect: `container` is the Kopia/kanister-tools process — the one
-that matters — and `metric-sidecar` is K10's metrics pusher. `POD` is the pause
-container and is always ~0.
-
-### Step 5 — K10's own worker-pod metric sidecar
-
-K10 runs a `metric-sidecar` container in every worker pod which pushes process metrics
-to `metering-svc`, where K10's Prometheus scrapes them. This works even without cluster
-monitoring, and it samples every 30 s rather than depending on cAdvisor's cadence.
-
-Check it is enabled:
+Works without cluster monitoring, samples every 30 s, and survives where cAdvisor
+misses a short pod. Check it is on:
 
 ```bash
 kubectl -n "$K10NS" get cm k10-config -o json \
-  | jq -r '.data | {WorkerPodMetricSidecarEnabled, WorkerPodMetricSidecarMetricLifetime, WorkerPodPushgatewayMetricsInterval}'
+  | jq -r '.data | {WorkerPodMetricSidecarEnabled, WorkerPodMetricSidecarMetricLifetime,
+                    WorkerPodPushgatewayMetricsInterval}'
 ```
 
-Validated values: `true`, `2m`, `30s`.
-
-Read it live during a run:
-
-```bash
-# pf_start / pf_stop come from guide 00 section 4
-pf_start metering-svc 18000:8000 || exit 1
-curl -s http://localhost:18000/v0/push-metric-agg/metrics | tee worker-pod-metrics-raw.txt
-pf_stop
-```
-
-Validated output, captured during a real export:
-
-```
-process_resident_memory_bytes{podType="create-repository"}          6.3787008e+07
-process_resident_memory_bytes{podType="repository-server"}          1.21389056e+08
-process_resident_memory_bytes{podType="repository-operations"}      2.47058432e+08
-process_resident_memory_bytes{podType="export-volume-to-repository"} 1.25087744e+08
-
-process_cpu_seconds_total{podType="create-repository"}              0.04
-process_cpu_seconds_total{podType="repository-server"}              0.08
-process_cpu_seconds_total{podType="repository-operations"}          0.19
-process_cpu_seconds_total{podType="export-volume-to-repository"}    0.11
-```
-
-Or from K10's Prometheus, which retains it:
+Validated: `true`, `2m`, `30s`.
 
 ```bash
 kq '{job="pushAggregator", __name__=~"process_resident_memory_bytes|process_cpu_seconds_total"}' \
@@ -230,28 +147,28 @@ kq '{job="pushAggregator", __name__=~"process_resident_memory_bytes|process_cpu_
   | tee worker-pod-metrics.tsv | column -t
 ```
 
-`podType` is the useful dimension here: `export-volume-to-repository` is the actual data
+`podType` is the useful dimension: `export-volume-to-repository` is the actual data
 movement, `repository-operations` is maintenance, `create-repository` is one-off setup.
-On the validation cluster `repository-operations` was the heaviest at 247 MiB RSS.
 
-**Limitation**: these series carry `podType` and nothing else — no pod name, no
-namespace, no PVC. With several concurrent datamovers of the same `podType`, the
-aggregator holds only the most recent push per `podType`, so concurrent values overwrite
-each other. Use this source for *per-podType* profiling and step 4 for *per-pod*
-figures.
+**Limitation**: these series carry `podType` and nothing else — no pod, no namespace,
+no PVC — and the aggregator holds only the most recent push per `podType`, so
+concurrent datamovers of the same type overwrite each other. With three namespaces
+exporting at once, as here, that makes it useless for attribution. Use it for
+per-`podType` profiling and step 2 for per-pod figures. Values also expire two minutes
+after the pod stops pushing (`WorkerPodMetricSidecarMetricLifetime`), so scrape live or
+rely on K10's Prometheus having captured them.
 
-Also note `WorkerPodMetricSidecarMetricLifetime = 2m`: values expire from the
-aggregator endpoint two minutes after the pod stops pushing. Scrape live, or rely on
-K10's Prometheus having captured them.
+### Step 5 — ephemeral storage, which needs a live capture
 
-### Step 6 — ephemeral storage per datamover pod
-
-Neither cAdvisor nor the sidecar covers `emptyDir`. Poll the kubelet during the run:
+Neither cAdvisor nor the sidecar covers `emptyDir`, and the datamover's Kopia cache is
+an `emptyDir`. The kubelet has it, but only while the pod exists — so this one must run
+*during* an export:
 
 ```bash
 cat > capture-ephemeral.sh <<'SH'
-#!/usr/bin/env bash
-K10NS=${K10NS:-kasten-io}; DUR=${1:-900}
+#!/usr/bin/env sh
+K10NS=${K10NS:-kasten-io}
+DUR=${1:-900}
 end=$(( $(date +%s) + DUR ))
 while [ "$(date +%s)" -lt "$end" ]; do
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -273,103 +190,88 @@ chmod +x capture-ephemeral.sh
   | tee datamover-ephemeral.tsv
 ```
 
-Then take the max per pod:
+Peak per pod:
 
 ```bash
-tail -n +2 datamover-ephemeral.tsv \
-  | awk -F'\t' '{ if ($4+0 > m[$3]) m[$3]=$4+0 } END { for (p in m) printf "%s\t%d\n", p, m[p] }' \
+awk -F'\t' 'NR>1 { if ($4+0 > m[$3]) m[$3]=$4+0 } END { for (p in m) printf "%s\t%d\n", p, m[p] }' \
+    datamover-ephemeral.tsv \
   | { printf 'POD\tPEAK_EPHEMERAL_MiB\n'; cat; } | column -t
 ```
 
-## Per-PVC attribution
+Compare the peak against `k10DataStoreTotalCacheSizeLimitMB` (3000) and against the
+node margin from guide 08 step 4.
 
-How far each source gets you:
+### Step 6 — trigger an export, if the pair is `@onDemand` or you need a clean window
 
-| Level | Achievable | How |
-|-------|-----------|-----|
-| namespace | **yes** | `app-name` label on `data-mover-svc-*` pods, joined on `pod` |
-| policy | **yes** | `policy-name` label |
-| job / action | **yes** | `k10.kasten.io/jobID` label, shared by all pods of one run |
-| PVC | **partially** | see below |
-
-A `copy-vol-data-*` pod handles exactly one volume, and it does mount a PVC — but it
-mounts an **ephemeral clone**, not the source. Verified: the pod mounted
-`kanister-pvc-tgg7j`, a temporary PVC created from the source volume's snapshot and
-deleted when the job ends. The source PVC name is not in the datamover pod's labels or
-spec.
-
-To close that last gap you must capture the clone PVCs while they exist:
+**This changes cluster state.** Agree a window first.
 
 ```bash
-# run alongside step 1
-while true; do
-  kubectl get pvc -A -o json \
-    | jq -r '.items[] | select(.metadata.name | startswith("kanister-pvc"))
-             | [ (now|strftime("%Y-%m-%dT%H:%M:%SZ")), .metadata.namespace, .metadata.name,
-                 (.spec.dataSource.name // "-"), (.spec.dataSource.kind // "-"),
-                 (.metadata.annotations | tostring) ] | @tsv'
-  sleep 3
-done | tee clone-pvc-map.tsv
+cat <<YAML | kubectl create -f -
+apiVersion: actions.kio.kasten.io/v1alpha1
+kind: RunAction
+metadata:
+  generateName: audit-run-
+  namespace: $K10NS
+spec:
+  subject:
+    kind: Policy
+    name: $AUDIT_POLICY
+    namespace: $K10NS
+YAML
 ```
 
-The clone's `spec.dataSource` points at the VolumeSnapshot, whose
-`spec.source.persistentVolumeClaimName` is the source PVC. Capture VolumeSnapshots in
-the same loop.
-
-**If that is too invasive, do not force it.** Take per-PVC *work* from Kopia instead
-(guides 04–06: exact file counts, bytes and deltas per PVC) and per-pod *resource
-consumption* from step 4. Attribute resources at namespace/job level and correlate with
-Kopia's per-PVC workload. That combination answers the sizing question without needing a
-live clone-PVC watcher.
+Start step 5's loop first, then trigger, then wait for the ExportAction to reach
+`Complete` and run steps 2 and 3 against it. Note that triggering `$AUDIT_POLICY`
+exports **every namespace it selects**, not just yours — three, here.
 
 ## Caveats
 
-- **Short-lived pods fall between cAdvisor samples.** The kubelet scrapes cAdvisor every
-  30 s by default. A 20-second datamover may produce one sample or none — on the
-  validation cluster only 1 of 4 worker pods yielded a usable memory series (84 MiB
-  peak, 18 MiB for its sidecar); the others read 0. **Peak RSS from a short run is a
-  floor, not a peak.** For meaningful figures, run the test policy against a namespace
-  big enough to keep the datamover alive for several minutes.
 - **Datamover pods have no resource requests or limits.** Verified: `resources: {}` on
   every container of every worker pod. Consequences: QoS class BestEffort, so they are
   evicted first under node pressure; no OOM limit, so a runaway datamover takes node
   memory from everything else; and the scheduler places them blind. Record this — it is
-  a finding, not just a data point.
-- **`workerPodResourcesCRDEnabled = false`** on the validation cluster. That is the
-  switch which lets an `ActionPodSpec` set datamover resources (guide 10). While it is
-  off, ActionPodSpec resource settings are ignored.
-- Sum `container` and `metric-sidecar` when reporting a pod's total footprint; the
-  sidecar was 18 MiB, not negligible at 10× concurrency.
-- The `container_memory_working_set_bytes` peak excludes page cache reclaim; for
-  OOM-risk assessment compare against `container_memory_max_usage_bytes` where
-  available.
+  a finding, not a data point.
+- **`workerPodResourcesCRDEnabled = false`** makes `ActionPodSpec` resource settings
+  inert (guide 10). While it is off, any sizing recommendation needs that flag flipped
+  first, and it requires a Helm upgrade — not a ConfigMap edit.
+- **Short-lived pods fall between cAdvisor samples.** The kubelet scrapes every 30 s. A
+  20-second datamover may produce one sample or none; `no-sample` rows say which. Peak
+  RSS from a short run is a **floor**. For meaningful figures, measure an export that
+  keeps the datamover alive for minutes.
+- **Sum `container` and `metric-sidecar`** when reporting a pod's footprint; the
+  sidecar was 18 MiB, not negligible at 10× concurrency. The queries here already sum
+  across containers, excluding the pause container and the pod cgroup.
+- **The window is padded by 45 s each side** (`DATAMOVER_PAD`). That slightly dilutes
+  the average-core figure — 3.5 % on a 40-minute export, much more on a 30-second one —
+  which is why `cpu-s` stays visible next to it.
 
 ## What to send back
 
 | File | Contents |
 |------|----------|
-| `datamover-usage-attributed.tsv` | peak RSS and CPU per pod, joined to namespace and policy (headline) |
-| `datamover-attribution.tsv` | pod → labels → node → mounted clone PVC → resources |
-| `datamover-peak-memory.tsv`, `datamover-cpu-seconds.tsv` | raw cAdvisor extracts |
-| `worker-pod-metrics.tsv` | per-`podType` RSS and CPU from K10's own sidecar |
+| `datamover-usage.txt` | peak memory and CPU for one export, own versus concurrent (headline) |
+| `datamover-all-exports.txt` | the same across the pair's export history |
+| `ksm-check.txt` | whether attribution was possible at all |
 | `datamover-ephemeral.tsv` | ephemeral-storage timeline per datamover pod |
-| `dm-specs/*.json` | full pod specs, the evidence for the `resources: {}` finding |
-| `action-windows.tsv` | start/end of each action, for range queries |
+| `worker-pod-metrics.tsv` | per-`podType` RSS and CPU from K10's own sidecar |
 
 ## Validation status
 
-Steps 1–6 fully validated on K10 9.0.5 by running a real policy end to end and
-capturing everything. Specifically confirmed:
+Fully validated on K10 9.0.5 against `prod-test` / `calibrate-backup`, on real
+scheduled exports — no test policy was needed, because the historical join works on
+retained metrics.
 
-- the cAdvisor label set contains `pod` but no pod labels — the join in step 4 is
-  necessary and sufficient for namespace-level attribution;
-- all 5 worker pods of a real run (`data-mover-svc` ×2, `copy-vol-data` ×2,
-  `create-repo` ×1) were captured by the step 1 loop, with their labels;
-- every worker-pod container had `resources: {}`;
-- the metric sidecar endpoint returned live per-`podType` RSS and CPU during the run and
-  went empty two minutes after;
-- `copy-vol-data` pods mount an ephemeral `kanister-pvc-*` clone, not the source PVC.
+Specifically confirmed: the cAdvisor label set contains `pod` but no pod labels;
+`kube_pod_labels` exposes 270 `label_*` keys for the K10 namespace; `copy-vol-data`
+pods carry only `k10.kasten.io/jobID` and were correctly resolved to their namespace
+through the `data-mover-svc` pod of the same job; three namespaces
+(`prod-test`, `large-test`, `test-calibrate`) plus a metadata mover in `kasten-io` were
+alive in one 323-second window, giving 743 MiB own against 961 MiB total; one pod
+produced no sample at all and is reported as such; every worker-pod container had
+`resources: {}`.
 
-Not validated: the clone-PVC watcher in [Per-PVC attribution](#per-pvc-attribution) was
-reasoned from captured pod specs, not executed — the clones were already gone by the
-time it was written. Treat that snippet as untested.
+Step 4's sidecar endpoint and `k10-config` values were verified. Steps 5 and 6 were
+**not** re-run in this pass — the capture loop and the `RunAction` pattern are carried
+over from an earlier validated run on this repository, where all five worker pods of a
+real run were captured and the sidecar returned live per-`podType` figures that went
+empty two minutes later. Step 5 in particular needs an export in flight.

@@ -1,6 +1,6 @@
 # 13 — Exports and restores with a performance or memory/CPU problem
 
-## What Global Engineering needs
+## What auditors need
 
 The concrete list of exports and restores that are slow, that fail, or that consume
 abnormal memory or CPU — with enough surrounding data to explain *why*. This is the
@@ -25,27 +25,74 @@ collecting, and write them into the report:
 > audit owner before presenting anything as a finding — the right numbers depend on the
 > customer's RPO commitments and on which namespaces they already consider problematic.
 
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
-
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/13-slow-jobs" && cd "$AUDIT_DIR/13-slow-jobs"
+. lib/init.sh
+focus_dir 13-slow-exports
 ```
 
-### Step 1 — job history with durations
+### Step 1 — the pair's exports, with what they moved
+
+The single most useful table in this guide, because it puts duration next to bytes:
 
 ```bash
-# pf_start / pf_stop come from guide 00 section 4
+export_table 20 | tee export-performance.tsv | column -t
+```
+
+Validated:
+
+```
+EXPORT                STATE     START                DUR_S  VOLUMES  TRANSFERRED  READ         CAPACITY     RATE_B_S    CHANGE_RATE
+scheduled-gn9w65njrc  Complete  2026-09-20T08:00:52  233    1        10300000000  10200000000  79456894976  219504793   0.2012
+scheduled-cdzgsbrfkz  Complete  2026-09-20T02:37:14  47     1        173          0            79456894976  1095333144  0
+scheduled-5x9wblcnls  Complete  2026-09-19T22:01:10  236    1        10300000000  10200000000  79456894976  216795966   0.2012
+scheduled-qhfwmmm2x4  Complete  2026-09-19T17:00:57  55     1        173          0            79456894976  918134538   0
+scheduled-gjmzmxzwqp  Complete  2026-09-19T08:13:43  587    1        51200000000  51200000000  79456894976  87304917    1
+```
+
+Derive throughput and rank:
+
+```bash
+awk -F'\t' 'NR==1 {print $0"\tMiB_PER_S"; next}
+     $4!="-" && $6!="-" && $4+0>0 {printf "%s\t%.1f\n", $0, $6/$4/1048576}' \
+    export-performance.tsv | sort -t"$(printf '\t')" -k11 -n | column -t \
+  | tee export-throughput.tsv
+```
+
+Validated: 42 MiB/s on the two incremental exports, 83 MiB/s on the full one. **The
+full export is faster per byte than the incrementals** — the incrementals pay the same
+100,003-file enumeration to move a fifth of the data. That is the file-count-bound
+signature, and no datamover tuning fixes it.
+
+> **The byte counters are on the `/details` subresource only.** On the ExportAction
+> object `status.progressDetails` and `status.actionDetails` are both `null`, which is
+> why they were long believed not to exist. `export_table` fetches
+> `GET /apis/actions.kio.kasten.io/v1alpha1/namespaces/<ns>/exportactions/<name>/details`
+> per action — about 0.2 s and 400 kB each, so bound it with the argument.
+
+`CAPACITY` is the **volume capacity**, not the data size. `READ` 0 with `TRANSFERRED`
+173 is a genuine no-op export, not a failure.
+
+Per-volume detail for one export — the only place the export names its PVCs:
+
+```bash
+export_volumes scheduled-gn9w65njrc | tee export-volumes.tsv | column -t
+```
+
+```
+PVC                   OPERATION  DATA_FORMAT  EXPORT_DIRECTIVE  STORAGE_CLASS  STORAGE_TYPE  SNAPSHOT_ID
+calibrate-100k-500kb  Upload     Filesystem   FileSystemMode    managed-csi    CSI           k10-csi-snap-847jnt89b4zdw6wm
+```
+
+`dataFormat: Filesystem` versus `Block` decides whether guides 04 and 05 apply at all.
+
+### Step 1b — queue time versus run time
+
+An export that "took 4 hours" may have spent 3 h 50 m waiting for a limiter slot. The
+job history separates the two:
+
+```bash
 pf_start jobs-svc 18081:8000 || exit 1
 curl -s http://localhost:18081/v0/jobs > jobs-raw.json
 pf_stop
@@ -53,50 +100,28 @@ pf_stop
 jq -r '
   # jobs-svc emits fractional seconds; fromdateiso8601 rejects them, so strip them first.
   def ts: sub("\\.[0-9]+(?=Z$)";"") | fromdateiso8601;
-  (["ID","STATUS","SCHEDULED","STARTED","COMPLETED","QUEUE_S","RUN_S","WAIT_COUNT","POLICY_ID"]|@tsv),
+  (["ID","STATUS","QUEUE_S","RUN_S","WAIT_COUNT","POLICY_ID"]|@tsv),
   ( .[]
     | (if .scheduledTime and .startedTime
          then ((.startedTime|ts) - (.scheduledTime|ts)) else null end) as $q
     | (if .startedTime and .completeTime
          then ((.completeTime|ts) - (.startedTime|ts)) else null end) as $r
-    | [ .id, .status, .scheduledTime, .startedTime, .completeTime,
-        ($q // "-"), ($r // "-"), (.waitCount // 0),
+    | [ .id, .status, ($q // "-"), ($r // "-"), (.waitCount // 0),
         (.originatingPolicies[0].id // "-") ] | @tsv )' jobs-raw.json \
   | tee job-durations.tsv | column -t
+
+kubectl -n "$K10NS" get policies.config.kio.kasten.io "$AUDIT_POLICY" \
+  -o jsonpath='{.metadata.uid}{"\n"}' | tee policy-uid.txt
 ```
 
-Validated output (IDs truncated), from two runs of the same policy:
+Queue time dominating run time is the **limiter** signature (guide 02 step 4), not a
+datamover problem. Cross-check against the `Skipped` count from guide 02 step 3: on
+this cluster 12 of 16 runs were skipped because the previous one had not finished.
 
-```
-ID        STATUS     QUEUE_S  RUN_S  WAIT_COUNT
-5720c6d0  succeeded  2        58     7
-58236bae  succeeded  2        38     5
-69c5d60c  succeeded  31       19     0
-d442aa4a  succeeded  8        69     8
-f09cab38  succeeded  48       13     0
-```
-
-Note `f09cab38`: 48 s queued, 13 s running. On a cluster under real load that pattern —
-queue time dominating run time — is the limiter signature, and no amount of datamover
-tuning will help it.
-
-`QUEUE_S` — the gap between scheduled and started — is as important as `RUN_S`. A large
-queue time means the limiters from guide 10 are the bottleneck, not the datamover.
-
-Rank the outliers:
+Per-phase detail for one slow job — this is what localises the problem:
 
 ```bash
-tail -n +2 job-durations.tsv | sort -t"$(printf '\t')" -k7 -rn | head -25 \
-  | { printf 'ID\tSTATUS\tSCHEDULED\tSTARTED\tCOMPLETED\tQUEUE_S\tRUN_S\tWAIT_COUNT\tPOLICY_ID\n'; cat; } \
-  | tee slowest-jobs.tsv | column -t
-```
-
-Join policy IDs to names via `policy-uid-map.tsv` from guide 02.
-
-Per-phase detail for a single slow job — this is what localises the problem:
-
-```bash
-JOB=<id from slowest-jobs.tsv>
+JOB=<id from job-durations.tsv>
 jq -r --arg id "$JOB" '.[] | select(.id==$id)
        | {id, status, errors, waitCount,
           phases: [.phases[] | {name, status, progress, weight}]}' jobs-raw.json \
@@ -134,14 +159,23 @@ where per-job attribution lives.
 ### Step 3 — the current state of actions
 
 ```bash
-for r in exportactions backupactions restoreactions importactions runactions; do
-  echo "=== $r ==="
-  kubectl get "$r.actions.kio.kasten.io" -A -o json \
-    | jq -r '.items[] | [ .metadata.namespace, .metadata.name, .status.state,
+for r in exportactions backupactions restoreactions; do
+  echo "=== $r in $AUDIT_NS ==="
+  kubectl -n "$AUDIT_NS" get "$r.actions.kio.kasten.io" -o json \
+    | jq -r '.items[] | [ .metadata.name, .status.state,
                           .status.startTime, .status.endTime, (.status.progress // "-"),
                           ((.status.error // .status.result) | tostring) ] | @tsv'
 done | tee actions-current.tsv | column -t
+
+echo "=== anything still running, cluster-wide ==="
+kubectl get exportactions.actions.kio.kasten.io -A -o json \
+  | jq -r '.items[] | select(.status.state == "Running")
+           | [ .metadata.namespace, .metadata.name, .status.startTime ] | @tsv' \
+  | tee running-now.tsv | column -t
 ```
+
+The cluster-wide `Running` list is there on purpose: a stuck export in **another**
+namespace holds limiter slots that `$AUDIT_NS` is waiting for.
 
 ### Step 4 — OOM kills and restarts of datamover pods
 
@@ -186,27 +220,40 @@ kubectl -n "$K10NS" get events --sort-by=.lastTimestamp -o json \
   | tee worker-pod-warnings.tsv | column -t
 ```
 
-### Step 5 — resource consumption of the slow jobs
+### Step 5 — resource consumption of the slow exports
 
-Cross-reference the slow jobs from step 1 with the datamover measurements from guide 09.
-For a job identified as slow, use its `k10.kasten.io/jobID` to find its pods, then pull
-their peak RSS and CPU over the job's window. Guide 09 steps 3–4 have the queries; the
-join key is the `pod` label.
-
-If the slow job is historical and its pods were never captured, you can still get the
-pods' resource series from cAdvisor by name pattern over the job window:
+No capture loop and no job-id arithmetic: guide 09's helper resolves the window from
+the ExportAction itself.
 
 ```bash
-S=<job start epoch>; E=<job end epoch>
-tqr 'max by (pod, container) (container_memory_working_set_bytes{namespace="'"$K10NS"'",pod=~"data-mover.*|copy-vol-data.*",container!="",container!="POD"})' \
-    "$S" "$E" 15s \
-  | jq -r '.data.result[] | [ .metric.pod, .metric.container,
-             ((.values|map(.[1]|tonumber)|max)/1048576*100|round/100) ] | @tsv' \
-  | tee "job-window-memory.tsv" | column -t
+awk -F'\t' 'NR>1 {print $1}' export-performance.tsv | while read -r a; do
+  printf '=== %s ===\n' "$a"
+  datamover_for_export "$a"
+done | tee datamover-per-export.txt
 ```
 
-You will get pod names without namespace attribution — acceptable when you already know
-which job's window you queried.
+Validated, for the slowest and the fastest export of the pair:
+
+```
+=== scheduled-gn9w65njrc ===   233 s, 10.3 GB
+peak sum memory   : 742.96 MiB
+cpu total         : 107.239 cpu-s  (avg 0.33 cores over the window)
+concurrent        : kasten-io,large-test,test-calibrate
+all datamovers    : 961.32 MiB peak - the load the cluster actually carried
+
+=== scheduled-9gwfn7ktqw ===   150 s, no-op export
+peak sum memory   : 365.06 MiB
+cpu total         : 0.042 cpu-s
+no sample         : copy-vol-data-lc7pj (alive for less than one scrape interval)
+```
+
+Two readings. **743 MiB for one PVC of 100,003 files** is the memory-per-file figure
+that sizes an `ActionPodSpec` — compare against the 1 GiB threshold in the table above.
+And `concurrent` naming three other namespaces means the node saw 961 MiB, not 743: if
+you are diagnosing node pressure, that is the number.
+
+A `no-sample` row means the pod lived less than one cAdvisor scrape interval, so the
+figures are a **floor**. Absence of a memory series is no evidence at all.
 
 ### Step 6 — K10 logs for the slow jobs
 
@@ -246,7 +293,7 @@ microseconds, which is how you distinguish a slow object store from a slow datam
 jq -rs '[ .[] | select(.m=="PutBlob" and .duration) ]
         | (map(.duration)|add/length) as $mean
         | "PutBlob count=\(length) mean_us=\($mean|round) max_us=\(map(.duration)|max)"' \
-   "$AUDIT_DIR/12-kopia/"*/tmp/kopia-debug-logs/logs-show-all-stdout.txt 2>/dev/null \
+   "$AUDIT_DIR/$AUDIT_NS.$AUDIT_POLICY/12-kopia/"*/tmp/kopia-debug-logs/logs-show-all-stdout.txt 2>/dev/null \
   | tee kopia-putblob-latency.txt
 ```
 
@@ -329,6 +376,14 @@ the dashboard or by deleting the `RestorePoint`.
   separately.
 - **Correlate with the storage backend.** A slow export against a saturated NFS server
   is not a K10 problem. Pull the backend's own metrics for the same window.
+- **A slow incremental is not a contradiction.** Kopia enumerates and `stat`s the whole
+  tree every run, serially *within* a directory and concurrently across directories. On
+  a volume with few huge directories that is roughly one random read per file, so a
+  latency-bound disk (Azure Premium P10 at 3–4 ms) gives ~250–375 entries/s whatever
+  the file size. Check `DIRS` next to `FILES` in guide 04 before blaming the network:
+  100,003 files in 2 directories here. Block-mode export is the remedy, not tuning.
+- **`/details` is not free.** About 0.2 s and 400 kB per action. Bound `export_table`
+  rather than fetching a thousand-action history.
 
 ## Requires the audit owner's input
 
@@ -344,54 +399,58 @@ to whoever runs the collection:
 
 | File | Contents |
 |------|----------|
-| `slowest-jobs.tsv` | the ranked outlier list (headline) |
+| `export-performance.tsv` | duration next to bytes for every export of the pair (headline) |
+| `export-throughput.tsv` | the same, ranked by MiB/s |
+| `export-volumes.tsv` | per-volume data format, storage class and CSI snapshot id |
+| `datamover-per-export.txt` | peak memory and CPU per export, own versus concurrent |
 | `job-durations.tsv` | every job with queue time and run time |
 | `failed-jobs.tsv`, `failed-pods.tsv`, `worker-pod-warnings.tsv` | failures |
 | `oomkilled.tsv`, `restarts.tsv` | memory and stability incidents |
-| `actions-current.tsv` | present state of all action objects |
-| `action-outcomes.tsv`, `action-duration-sums.tsv` | cluster-wide counters |
+| `actions-current.tsv`, `running-now.tsv` | present state, and anything blocking a limiter |
 | `job-<id>-phases.json` | per-phase breakdown of each outlier |
 | `kopia-putblob-latency.txt` | object-store latency, to separate backend from datamover |
 | `executor-errors.txt`, `k10-*.log` | filtered and raw K10 log excerpts, all replicas |
 
 ## Validation status
 
-Partially validated. What was confirmed on the validation cluster:
+Validated on K10 9.0.5 against `prod-test` / `calibrate-backup`.
 
-- `jobs-svc /v0/jobs` returns HTTP 200 and well-formed JSON; after a policy run it
-  returned 7 job records with populated `scheduledTime`, `startedTime`, `completeTime`,
-  `status`, `waitCount`, `phases[]` and `originatingPolicies[]`, and with `jobType`,
-  `phaseName` and `createdTime` null. The duration arithmetic in step 1 was run against
-  that real response — and the first version of it was wrong: `fromdateiso8601` rejects
-  the fractional seconds K10 emits (`2026-09-15T13:07:01.466Z`), which is why the query
-  above strips them. The corrected query produced the durations quoted in step 1.
-- Step 3's action resources exist and return data (`ExportAction` with `state`,
-  `startTime`, `endTime`, `progress`). Note that `status.actionDetails` was `null` — the
-  actions do **not** carry transferred-byte counts, which is why guide 06 goes to Kopia
-  instead.
+> **Correction to an earlier version of this guide.** It stated that
+> "`status.actionDetails` was `null` — the actions do **not** carry transferred-byte
+> counts". That was a correct observation of the wrong object. The counters exist on
+> the **`/details` subresource**, and step 1 now reads them: the same ExportAction
+> that reports `progressDetails: null` on `kubectl get -o json` returns
+> `transferredBytes: 10300000000`, `readBytes: 10200000000`,
+> `totalBytes: 79456894976` and `processingRate: 219504793` from
+> `GET .../exportactions/scheduled-gn9w65njrc/details`, plus per-volume operations with
+> the PVC name, data format and CSI snapshot id. Guide 06 no longer has to reach for
+> Kopia to answer "how much did this export move" — although it still does, as an
+> independent check, and the two agreed to within 0.6 %.
+
+Confirmed in this pass:
+
+- `export_table` returned duration, transferred bytes and change rate for all five
+  retained exports of the pair. Throughput came out at 42 MiB/s on the two incremental
+  exports against 83 MiB/s on the full one — **the incrementals are slower per byte**,
+  because they pay the same 100,003-file enumeration to move a fifth of the data.
+  That is a file-count-bound export, and it is the finding the guide is for.
+- `datamover_for_export` (step 5) resolved each export's window and reported 743 MiB
+  peak for this namespace against 961 MiB for all datamovers alive at the time — three
+  other namespaces of the same policy were exporting concurrently.
+- Step 3's action resources return `state`, `startTime`, `endTime` and `progress`.
 - Steps 2, 4 and 6 queries all execute and return data.
-- Step 7's policy-and-RunAction pattern was validated: an on-demand policy run was
-  triggered twice and completed in ~50 s and ~61 s, producing the datamover pods
-  analysed in guide 09.
 
-- Steps 4 and 6 were re-validated using the derived window from guide 00 §6
-  (`AUDIT_WINDOW_DAYS=15`); `kube_pod_container_status_restarts_total` returned 240
-  series over that range in the `kasten-io` namespace. The step 6 log collection was
-  corrected twice in the process: `--since=15d` is rejected by `kubectl`
-  (`unknown unit "d"`), and `logs deploy/executor-svc` silently read 1 of 3 replicas.
-  The label-selector form returned 998 / 29 / 94 lines for executor /
-  controllermanager / jobs over 360 h.
+Carried over from earlier validated runs on this repository: `jobs-svc /v0/jobs`
+returns HTTP 200 and well-formed JSON, with `jobType`, `phaseName` and `createdTime`
+null even where `phases[]`, `startedTime` and `completeTime` are populated — the
+duration arithmetic in step 1b strips the fractional seconds that `fromdateiso8601`
+rejects (`2026-09-15T13:07:01.466Z`), which the first version of that query did not.
+Step 6's log collection was corrected twice in the same way: `--since=15d` is rejected
+by `kubectl` (`unknown unit "d"`), and `logs deploy/executor-svc` silently reads 1 of 3
+replicas, so the label-selector form with `--max-log-requests` is the one here.
 
-What was **not** validated: the outlier analysis itself. The validation cluster had
-minutes of job history, no failures, no OOM kills and no evicted pods, so
-`slowest-jobs.tsv`, `oomkilled.tsv` and `restarts.tsv` were all empty. The queries are
-correct; their output on a cluster with real problems has not been seen.
-
-Note also that the validation cluster's Prometheus runs on `emptyDir` with 15 days of
-retention and both replicas up for 78+ days, so `AUDIT_WINDOW_DAYS` came out at the
-retention ceiling. The short-window branch of guide 00 §6 — where replica uptime rather
-than retention is the binding constraint — was therefore validated arithmetically only,
-not against a genuinely recently-restarted Prometheus. **This was reviewed and accepted
-as sufficient; it is a closed question, not an outstanding gap.** If you do hit a
-cluster where uptime is the binding constraint, the derived window is still worth
-sanity-checking once against the measured-oldest-sample probe in guide 00 §6.
+What was **not** validated: the outlier analysis itself. This cluster had no failed
+exports, no OOM kills and no evicted pods, so `failed-jobs.tsv`, `oomkilled.tsv` and
+`restarts.tsv` were empty. The queries are correct; their output on a cluster with real
+failures has not been seen. Step 7's test-policy pattern was validated on an earlier
+run but not re-exercised here — the pair exports hourly on its own.

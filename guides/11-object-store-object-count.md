@@ -1,12 +1,12 @@
 # 11 — Number of objects on the object storages
 
-## What Global Engineering needs
+## What auditors need
 
-Per Location Profile / bucket / repository prefix: the number of objects and the number
-of bytes. Object count drives list-operation cost, Kopia maintenance duration, and — on
-S3-compatible backends with per-request pricing — the actual bill. A repository with
-millions of small blobs behaves very differently from one with the same bytes in large
-packs.
+For `$AUDIT_PROFILE` and the repository of `$AUDIT_NS`: the number of objects and the
+number of bytes. Object count drives list-operation cost, Kopia maintenance duration
+and — on S3-compatible backends with per-request pricing — the actual bill. A repository
+with millions of small blobs behaves very differently from one with the same bytes in
+large packs.
 
 ## Four ways to get it, cheapest first
 
@@ -20,153 +20,154 @@ packs.
 **Use the provider's inventory if one exists.** A full `LIST` walk of a
 hundred-million-object bucket is slow and, on S3, costs real money.
 
-## Setup
-
-```bash
-. lib/init.sh
-```
-
-Sourcing `lib/init.sh` exports `K10NS`, `AUDIT_DIR`, `CLUSTER_UID`, the metrics window
-(`AUDIT_WINDOW_DAYS`, `AUDIT_START`, `AUDIT_END`, `AUDIT_RANGE`) and the query helpers
-(`tq`, `tqr`, `kq`, `pf_start`, `pf_stop`). It is idempotent — run it at the start of
-every guide and in every new terminal. See [00-prerequisites.md](00-prerequisites.md).
-
 ## Method
 
 ```bash
-mkdir -p "$AUDIT_DIR/11-object-store" && cd "$AUDIT_DIR/11-object-store"
+. lib/init.sh
+focus_dir 11-object-store
 ```
 
-### Step 1 — enumerate the profiles and their prefixes
+Steps 1 and 2 need the `debug-kopia-*` pod from guide 12 step 4.
+
+### Step 1 — the profile and the repository prefix
 
 ```bash
-kubectl -n "$K10NS" get profiles -o json > profiles-raw.json
+kubectl -n "$K10NS" get profiles "$AUDIT_PROFILE" -o json > profile-raw.json
 
 jq -r '(["PROFILE","TYPE","OBJSTORE_TYPE","ENDPOINT","BUCKET","PREFIX","REGION","CRED_SECRET"]|@tsv),
-       (.items[]
-        | . as $p | ($p.spec.locationSpec // {}) as $l | ($l.objectStore // {}) as $o
-        | [ $p.metadata.name, ($l.type // "-"),
-            ($o.objectStoreType // "-"), ($o.endpoint // "-"),
-            ($o.name // "-"), ($o.path // "-"), ($o.region // "-"),
-            (($l.credential.secret.name) // "-") ] | @tsv)' profiles-raw.json \
-  | tee profiles.tsv | column -t
+       ([ .metadata.name,
+          (.spec.locationSpec.type // "-"),
+          (.spec.locationSpec.objectStore.objectStoreType // "-"),
+          (.spec.locationSpec.objectStore.endpoint // "-"),
+          (.spec.locationSpec.objectStore.name // "-"),
+          (.spec.locationSpec.objectStore.path // "-"),
+          (.spec.locationSpec.objectStore.region // "-"),
+          (.spec.locationSpec.credential.secret.name // "-") ] | @tsv)' profile-raw.json \
+  | tee profile.tsv | column -t
 ```
 
-Validated output:
-
-```
-PROFILE              TYPE         OBJSTORE_TYPE  ENDPOINT                                  BUCKET  PREFIX                                                   CRED_SECRET
-azurefile-filestore  FileStore    -              -                                         -       -                                                        -
-my-s3-bucket         ObjectStore  S3             http://minio.minio.svc.cluster.local:9000 mod     k10/0f7c6f0e-1a2b-4c3d-9e8f-0123456789ab/migration                               k10-minio-creds
-```
-
-Note that the prefix embeds the **cluster UID**. On a bucket shared between clusters,
-this is what separates them — count per prefix, not per bucket, or you will attribute
-another cluster's objects to this one.
-
-The cluster UID is the UID of the `default` namespace (guide 00 §2), so you can resolve
-a prefix back to a cluster — or confirm which prefix belongs to the cluster in front of
-you — without touching K10:
+The repository's own view of where it lives — this is the **exact prefix** the pair
+writes to, which the profile alone does not tell you:
 
 ```bash
-export CLUSTER_UID=$(kubectl get ns default -o jsonpath='{.metadata.uid}')
-# Guard: grep -v "" excludes EVERY line, so an empty CLUSTER_UID silently reports
-# "no foreign prefixes" below. Never let it run empty.
+kopia_exec 'kopia repository status --json' > repository-status.json
+jq -r '{uniqueIDHex,
+        storage: {type: .storage.type,
+                  bucket: .storage.config.bucket,
+                  prefix: .storage.config.prefix},
+        format:  {version: .contentFormat.version,
+                  maxPackSize: .contentFormat.maxPackSize,
+                  indexVersion: .contentFormat.indexVersion}}' repository-status.json \
+  | tee repository-location.json
+```
+
+Validated:
+
+```json
+{
+  "uniqueIDHex": "3f1c9a0e5d2b47a8916c0fe3ab74d5c28e60b1937fa4d50cb8e2716340df9ac5",
+  "storage": {"type": "s3", "bucket": "my-s3-profile",
+              "prefix": "k10/0f7c6f0e-.../migration/repo/7b21c4de-9f03-4a61-8c5d-1e2f3a4b5c6d/"},
+  "format": {"version": 3, "maxPackSize": 20971520, "indexVersion": 2}
+}
+```
+
+Three things to read:
+
+- The prefix embeds the **cluster UID** (the `default` namespace UID, guide 00 §2) and
+  then a **per-repository UUID**. On a shared bucket that is what separates this
+  cluster's data from a neighbour's, and this pair's from another pair's. Count per
+  prefix, never per bucket.
+- `format.version 3` with `indexVersion 2` is current. A repository still on v1/v2 with
+  no epoch manager is a migration candidate and a known performance problem.
+- `maxPackSize` is the denominator for the histogram in step 2.
+
+A profile of type `FileStore` has no bucket at all — `mastodon-backup` on this cluster
+exports to `azurefile-filestore`. Steps 2 and 3 do not apply; report the share and its
+free space instead.
+
+Foreign prefixes in the same bucket — data from a cluster that was rebuilt or
+decommissioned, still costing storage:
+
+```bash
 : "${CLUSTER_UID:?empty - re-run guide 00 section 2}"
-
-grep -c "$CLUSTER_UID" profiles.tsv     # profiles belonging to THIS cluster
+grep -c "$CLUSTER_UID" profile.tsv
 ```
 
-That also means any `k10/<uuid>/...` prefix in the bucket whose UUID is not the
-`default` namespace UID of a live cluster is a strong orphan candidate — data from a
-cluster that has been rebuilt or decommissioned. Worth listing separately:
+The guard is not decoration: `grep -v ""` excludes **every** line, so an empty
+`CLUSTER_UID` silently reports "no orphans".
+
+### Step 2 — object count and size histogram, from Kopia
+
+Exact, scoped to this repository's prefix, no bucket walk, no cost:
 
 ```bash
-kubectl -n "$K10NS" exec objcount -- sh -c "
-  mc alias set t '$ENDPOINT' \"\$AWS_ACCESS_KEY_ID\" \"\$AWS_SECRET_ACCESS_KEY\" >/dev/null
-  mc ls t/$BUCKET/k10/" | tee cluster-prefixes-in-bucket.txt
-
-: "${CLUSTER_UID:?empty - re-run guide 00 section 2}"
-grep -v "$CLUSTER_UID" cluster-prefixes-in-bucket.txt | tee foreign-cluster-prefixes.txt
+kopia_exec 'kopia blob stats' | tee blob-stats.txt
+kopia_exec 'kopia blob list --json' > blob-list.json
+jq -r '[.[] | select(.id|test("^[pq]"))] as $p
+       | {objects: length, bytes: ([.[].length]|add),
+          packObjects: ($p|length), packBytes: ([$p[].length]|add)}' blob-list.json \
+  | tee blob-summary.json
 ```
 
-Validated output — one prefix, matching this cluster, no orphans:
+Validated:
 
 ```
-[2026-09-15 19:53:43 UTC]     0B 0f7c6f0e-1a2b-4c3d-9e8f-0123456789ab/
-```
-
-An empty `foreign-cluster-prefixes.txt` is the clean result. Anything listed there is
-data K10 on this cluster will never touch, never retire and never count — it just
-accrues storage cost. Report it, but do **not** delete it during an audit: the owning
-cluster may still exist, and on a versioned or object-locked bucket deletion may not
-even be reversible.
-
-### Step 2 — preferred: `kopia blob stats`, per repository
-
-Exact, scoped to the repository prefix, and it comes with a size histogram. Already
-produced by the guide 12 diagnose bundle — no extra work:
-
-```bash
-grep -H -A12 '^Count:' "$AUDIT_DIR/12-kopia/"*/kopia-debug-logs/blob-stats-stdout.txt
-```
-
-Or live, from a connected debug pod (guide 12):
-
-```bash
-kubectl -n "$K10NS" exec "$DEBUG_POD" -- sh -c \
-  'export KOPIA_CONFIG_PATH=/tmp/kopia-repository.config; kopia blob stats' \
-  | tee blob-stats.txt
-```
-
-Validated output:
-
-```
-Count: 19
-Total: 2.9 MB
-Average: 150.2 KB
+Count: 3452
+Total: 71.7 GB
+Average: 20.8 MB
 Histogram:
-        0 between 0 B and 10 B (total 0 B)
-        1 between 10 B and 100 B (total 30 B)
-        7 between 100 B and 1 KB (total 3 KB)
-       10 between 1 KB and 10 KB (total 32.9 KB)
-        0 between 10 KB and 100 KB (total 0 B)
-        0 between 100 KB and 1 MB (total 0 B)
-        1 between 1 MB and 10 MB (total 2.8 MB)
+        2 between 10 B and 100 B (total 48 B)
+       11 between 100 B and 1 KB (total 3.3 KB)
+       16 between 1 KB and 10 KB (total 53.6 KB)
+        3 between 100 KB and 1 MB (total 1.9 MB)
+        5 between 1 MB and 10 MB (total 16.1 MB)
+     3415 between 10 MB and 100 MB (total 71.7 GB)
 ```
 
-`Count` is the object count in that repository's prefix. The histogram is the diagnostic
-that matters: 17 of 19 blobs under 10 KB means Kopia is not filling its packs, which
-points at either a very small dataset or an over-frequent flush.
+```json
+{"objects": 3452, "bytes": 71716788616, "packObjects": 3428, "packBytes": 71707612383}
+```
 
-Add the index and content counts, which drive maintenance cost:
+`Count` is the object count in this repository's prefix. **The histogram is the
+diagnostic**: 3,415 of 3,452 blobs in the 10–100 MB bucket against a 20 MB
+`maxPackSize` means packs are being filled properly. The opposite shape — most blobs
+under 10 KB — means Kopia is flushing before packs fill, which multiplies object count,
+list cost and maintenance time for the same bytes.
+
+3,428 of 3,452 objects are pack blobs; the remaining 24 are indexes, logs and the
+format blob.
+
+Index and content counts, which drive maintenance cost:
 
 ```bash
-kubectl -n "$K10NS" exec "$DEBUG_POD" -- sh -c \
-  'export KOPIA_CONFIG_PATH=/tmp/kopia-repository.config
-   echo "--- index blobs ---";  kopia index list | wc -l
-   echo "--- contents ---";     kopia content stats' | tee index-content-stats.txt
+kopia_exec 'kopia index list'    | wc -l | tee index-blob-count.txt
+kopia_exec 'kopia content stats' | tee content-stats.txt
 ```
 
-### Step 3 — full bucket walk with `mc`
+### Step 3 — full prefix walk with `mc`, when you need the bucket's own answer
 
-Use when you need the bucket total, or when there is no Kopia repository yet.
+Use when reconciling against the provider's bill, or when there is no repository yet.
 
 The credential secret uses **lowercase** keys (`aws_access_key_id`,
-`aws_secret_access_key`). `envFrom.secretRef` therefore creates lowercase environment
-variables, and `mc`/`aws` will not see `AWS_ACCESS_KEY_ID`. Map them explicitly — this
-is the single most common way this step fails silently with `Access Denied`:
+`aws_secret_access_key`). An `envFrom.secretRef` therefore creates lowercase
+environment variables and `mc`/`aws` will not see `AWS_ACCESS_KEY_ID`. Map them
+explicitly — this is the single most common way this step fails silently with
+`Access Denied`:
 
 ```bash
-kubectl -n "$K10NS" get secret k10-minio-creds -o json | jq -r '.data | keys'
-# => ["aws_access_key_id","aws_secret_access_key"]
+SECRET=$(jq -r '.spec.locationSpec.credential.secret.name' profile-raw.json)
+BUCKET=$(jq -r '.spec.locationSpec.objectStore.name' profile-raw.json)
+ENDPOINT=$(jq -r '.spec.locationSpec.objectStore.endpoint' profile-raw.json)
+PREFIX=$(jq -r '.storage.config.prefix' repository-status.json)
+kubectl -n "$K10NS" get secret "$SECRET" -o json | jq -r '.data | keys'
 
-cat <<'YAML' | kubectl apply -f -
+cat <<YAML | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
   name: objcount
-  namespace: kasten-io
+  namespace: $K10NS
   labels: {app.kubernetes.io/name: k10-audit-objcount}
 spec:
   restartPolicy: Never
@@ -176,44 +177,31 @@ spec:
     command: ["sleep","3600"]
     env:
     - name: AWS_ACCESS_KEY_ID
-      valueFrom: {secretKeyRef: {name: k10-minio-creds, key: aws_access_key_id}}
+      valueFrom: {secretKeyRef: {name: $SECRET, key: aws_access_key_id}}
     - name: AWS_SECRET_ACCESS_KEY
-      valueFrom: {secretKeyRef: {name: k10-minio-creds, key: aws_secret_access_key}}
+      valueFrom: {secretKeyRef: {name: $SECRET, key: aws_secret_access_key}}
 YAML
 
 kubectl -n "$K10NS" wait --for=condition=Ready pod/objcount --timeout=300s
 
-ENDPOINT=http://minio.minio.svc.cluster.local:9000   # from profiles.tsv
-BUCKET=mod
-
 kubectl -n "$K10NS" exec objcount -- sh -c "
-  mc alias set t '$ENDPOINT' \"\$AWS_ACCESS_KEY_ID\" \"\$AWS_SECRET_ACCESS_KEY\" >/dev/null
-  echo '=== objects and bytes per prefix ==='
-  mc du --depth 6 t/$BUCKET
-  echo '=== total objects ==='
-  mc ls --recursive t/$BUCKET | wc -l
+  mc alias set t '${ENDPOINT:-https://s3.amazonaws.com}' \"\$AWS_ACCESS_KEY_ID\" \"\$AWS_SECRET_ACCESS_KEY\" >/dev/null
+  echo '=== this repository prefix ==='
+  mc du 't/$BUCKET/$PREFIX'
+  echo '=== whole K10 prefix in the bucket ==='
+  mc du --depth 4 't/$BUCKET/k10'
 " | tee objcount-mc.txt
 
 kubectl -n "$K10NS" delete pod objcount
 ```
 
-Validated output after two backup cycles:
-
-```
-=== objects and bytes per prefix ===
-2.9MiB	35 objects	mod/k10/0f7c6f0e-1a2b-4c3d-9e8f-0123456789ab/migration
-2.9MiB	35 objects	mod/k10/0f7c6f0e-1a2b-4c3d-9e8f-0123456789ab
-2.9MiB	35 objects	mod/k10
-2.9MiB	35 objects	mod
-=== total objects ===
-35
-```
-
 `mc du` output is cumulative up the tree — the deepest line is the one to read, and the
-shallower ones are roll-ups, not additional objects.
+shallower ones are roll-ups, not additional objects. If listing the bucket root returns
+`Access Denied` but the prefix works, the credential is scoped to the bucket: expected
+and fine. Start from `t/$BUCKET`, never `t`.
 
-If listing the bucket root returns `Access Denied` but the prefix works, the credential
-is scoped to the bucket — expected and fine. Start from `t/$BUCKET`, never `t`.
+Compare the prefix total against step 2's `Count` and `Total`. A gap means either
+noncurrent versions (see the caveats) or objects Kopia no longer references.
 
 ### Step 4 — provider-native counts, no cluster involvement
 
@@ -258,22 +246,22 @@ mc ls --summarize --recursive "t/$BUCKET"
 
 ### Step 5 — K10's artifact accounting, for reconciliation
 
-Not an object count, but it tells you how many restore-point artifacts K10 believes it
-has. A large gap against step 2 suggests orphaned data.
+Not an object count, but it says how many restore-point artifacts K10 believes it has.
+A large gap against step 2 suggests orphaned data.
 
 ```bash
+k10prom_start
 kq 'catalog_storage_artifact_count' \
   | jq -r '(["APP_TYPE","CATEGORY","RETIREMENT","COUNT"]|@tsv),
            (.data.result[] | [ (.metric.app_type // "-"), .metric.category,
                                .metric.retirement, .value[1] ] | @tsv)' \
   | tee artifact-count.tsv | column -t
-
-kq 'catalog_repository_version_count' \
-  | jq -r '.data.result[] | [.metric.version, .value[1]] | @tsv' | tee repo-version-count.tsv
+k10prom_stop
 ```
 
-Cross-check against the orphan count from `repo-checker -r inventory` (guide 12), which
-reports `OrphanedCount`, `NotSyncedCount` and `DanglingCount` per repository.
+Cross-check against the orphan counts from `repo_checker -r inventory` (guide 12
+step 1), which reports `OrphanedCount`, `NotSyncedCount` and `DanglingCount` per
+repository.
 
 ## Caveats
 
@@ -294,35 +282,41 @@ reports `OrphanedCount`, `NotSyncedCount` and `DanglingCount` per repository.
   (guide 12) and the bucket's retention configuration.
 - `catalog_storage_artifact_count` counts K10 artifacts, not objects. A single artifact
   maps to many Kopia blobs. Never present it as an object count.
-- **One profile can hold several repositories.** On the validation cluster the single
-  `my-s3-bucket` profile held two (`kopia-volumedata-*` and `kopia-metadata-*`), each
-  with its own prefix and its own `blob stats`. Sum them for the profile total.
+- **One profile holds many repositories** — one per namespace for volume data, plus
+  metadata and migration repositories. Step 2 counts **this pair's** repository only.
+  For the profile total, sum across the repositories listed by guide 12 step 1; do not
+  present a per-pair figure as the bucket's size.
 
 ## What to send back
 
 | File | Contents |
 |------|----------|
-| `profiles.tsv` | every profile with its bucket, prefix and cluster UID |
-| `foreign-cluster-prefixes.txt` | `k10/<uuid>/` prefixes in the bucket that do not belong to this cluster |
-| `blob-stats.txt` | per-repository object count, total bytes and size histogram (headline) |
-| `objcount-mc.txt` | full bucket/prefix walk, if performed |
-| `index-content-stats.txt` | index blob count and content statistics |
-| `artifact-count.tsv`, `repo-version-count.tsv` | K10's own accounting for reconciliation |
+| `blob-stats.txt` | object count, total bytes and size histogram for this repository (headline) |
+| `blob-summary.json` | objects, bytes, pack objects and pack bytes as numbers |
+| `repository-location.json` | the exact prefix, format version and max pack size |
+| `profile.tsv` | the profile with its bucket, endpoint and credential secret |
+| `objcount-mc.txt` | prefix walk, if performed |
+| `index-blob-count.txt`, `content-stats.txt` | index and content counts, maintenance cost drivers |
+| `artifact-count.tsv` | K10's own accounting, for reconciliation |
 | provider inventory export | if available, preferred over any walk |
 
 ## Validation status
 
-Steps 1, 2, 3 and 5 fully validated on K10 9.0.5 against an in-cluster MinIO S3 profile.
-Confirmed there: the lowercase-secret-key trap — an `envFrom.secretRef` pod produced
-`Access Denied` on every operation until the env vars were mapped explicitly; `mc du`
-reporting cumulative roll-ups up the prefix tree; bucket-root listing denied while
-prefix listing succeeded; 35 objects / 2.9 MiB after two backup cycles, consistent with
-`kopia blob stats` reporting 19 blobs for one of the two repositories in that prefix.
+Steps 1, 2 and 5 fully validated on K10 9.0.5 against `prod-test` /
+`calibrate-backup` on the `my-s3-profile` S3 profile: 3,452 objects, 71.7 GB,
+3,428 of them pack blobs, format version 3, `maxPackSize` 20 MB, and a histogram with
+3,415 blobs in the 10–100 MB bucket — a properly packed repository.
 
-The cluster-prefix / orphan-detection snippet was validated: the `default` namespace UID
-matched the single `k10/<uuid>/` prefix present in the bucket, and
-`foreign-cluster-prefixes.txt` came out empty as expected.
+`kopia repository status --json` resolved the per-repository prefix
+(`k10/<cluster-uid>/migration/repo/<repo-uuid>/`), confirming that one profile holds a
+separate prefix per namespace: the three namespaces of `calibrate-backup` have three
+different repository UUIDs under the same bucket.
 
-Step 4's provider commands are documented from the vendor CLIs and were **not** executed
-— the validation cluster had no cloud object store attached. Verify the exact flags
-against your CLI version before relying on them.
+The `FileStore` case in step 1 was confirmed by inspection of the
+`azurefile-filestore` profile used by `mastodon-backup` — it has no `objectStore`
+block at all.
+
+Step 3's lowercase-secret-key trap and `mc du` roll-up behaviour are carried over from
+an earlier validated run against an in-cluster MinIO profile; step 3 was **not** re-run
+here, because step 2 answers the same question for this pair without a bucket walk.
+Step 4's provider commands are documented from the vendor CLIs and were not executed.
