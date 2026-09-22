@@ -413,12 +413,18 @@ than discovering a rejected pod half an hour into the export you were trying to 
 | Override the `kopia-cache-volume` volume by name | **works** — `emptyDir` replaced by the PVC, K10's own mount untouched |
 | `k10-scc` patched to allow `ephemeral` | **required** — without it every worker pod is rejected and all backups fail |
 | Small policy end to end | **Complete**, one `<pod>-kopia-cache-volume` PVC per worker pod, created and deleted with it |
-| Five-million-file export | 50 GiB cache PVCs bound, **0 evictions**, bytes moving — where every previous attempt sat at 0 bytes and was evicted within 21–34 minutes |
+| Five-million-file export | **40 minutes, 0 evictions, 2.2 GB transferred and rising** — every previous attempt was evicted within 21–34 minutes having transferred nothing |
 
-The last row was still in flight when this was written: the export had passed sixteen
-minutes with no eviction and 294 MB transferred, against four prior attempts that
-transferred nothing at all before dying. Treat the eviction as fixed and the end-to-end
-duration as not yet measured.
+The eviction is fixed. The export ran past forty minutes — comfortably beyond the 21–34
+minute band in which all four previous attempts died — with no eviction of any worker pod
+and a transfer rate climbing from 0.7 to 4.5 MB/s as Kopia got through the enumeration. It
+was still running when this was written, so the **end-to-end duration is not yet measured**;
+the first full export of this volume took 4.5 hours and there is no reason to expect much
+better, which is the argument for block mode below rather than for this fix.
+
+One number to take from the PVC list while that ran: **six** cache PVCs bound at 50 GiB, or
+300 GiB provisioned, including one for the *block-mode* policy's upload pod — which does not
+need it. That is the blast radius in the last bullet above, visible in practice.
 
 ### The cheaper fix: export the same volume in block mode
 
