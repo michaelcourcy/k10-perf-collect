@@ -138,6 +138,69 @@ list cost and maintenance time for the same bytes.
 3,428 of 3,452 objects are pack blobs; the remaining 24 are indexes, logs and the
 format blob.
 
+#### What the bucket holds versus what your data costs
+
+`blob stats` answers "how many objects and how many bytes are in this prefix". It does
+**not** answer "how much of that is live data" — and on a repository with failing exports
+or lagging maintenance those are very different numbers.
+
+```bash
+kopia_exec 'kopia blob list --json' > blob-list.json
+kopia_exec 'kopia content list --json' > contents.json
+
+echo "=== stored: every object in the bucket, by prefix ==="
+jq -r '[.[] | {p:(.id[0:1]), l:.length}] | group_by(.p)
+       | map({prefix:.[0].p, blobs:length, GiB:((map(.l)|add)/1073741824*100|round/100)})
+       | sort_by(-.GiB) | .[] | "\(.prefix)\t\(.blobs)\t\(.GiB)"' blob-list.json \
+  | { printf 'PREFIX\tBLOBS\tGiB\n'; cat; } | column -t
+
+echo "=== live content inside those packs ==="
+jq -r '[.[] | select(.deleted//false | not)]
+       | {contents: length,
+          physicalGiB: (([.[].length]|add)/1073741824*100|round/100),
+          logicalGiB: (([.[] | .originalLength//.length]|add)/1073741824*100|round/100)}' contents.json
+```
+
+Validated on the five-million-file repository:
+
+```
+PREFIX  BLOBS  GiB      what it is
+p       17460  339.9    data packs
+q       237    3.34     metadata packs
+x       646    2.0      index blobs
+_       261    1.0      Kopia's own logs
+k,s     6      ~0       format and config
+                346.2   total stored
+```
+
+```json
+{"contents": 10966344, "physicalGiB": 105.4, "logicalGiB": 108.19}
+```
+
+| Figure | Source | Means |
+|---|---|---|
+| **stored** 346.2 GiB | `blob list`, all objects | what the object store bills you for |
+| **content physical** 105.4 GiB | `content list`, live entries, `length` | live data inside the packs, after compression and encryption |
+| **content logical** 108.2 GiB | same entries, `originalLength` | the same data before compression |
+| **dedup+compression** 0.97× | physical ÷ logical | here 3 %, because the data is random |
+
+**Stored is 3.3× the live content.** Kopia never edits a pack in place: superseded content
+keeps occupying its pack until a full maintenance rewrites the survivors and deletes the
+old blobs. So `stored − content physical` is dead space awaiting reclamation — 238 GiB here,
+70 % of the bucket — plus index and logs, which are only 3 GiB of it.
+
+That gap is a symptom, not a constant. Check whether maintenance is keeping up:
+
+```bash
+jq -r '.schedule.runs["full-rewrite-contents"] | last | {end, success, extra}' \
+   kopia-maintenance-info.json
+```
+
+Validated: the last rewrite that did any work ran three days earlier and rewrote **0**
+contents, while hourly exports had been failing and uploading packs throughout — a failed
+export still writes data. A ratio near 1.0 is healthy; well above it means maintenance is
+behind, exports are failing, or both.
+
 Index and content counts, which drive maintenance cost:
 
 ```bash

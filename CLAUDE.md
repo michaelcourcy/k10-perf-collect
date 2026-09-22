@@ -158,6 +158,7 @@ When either side learns something about a data source, change both. In particula
 | Files changed | `stats.fileCount` / `stats.cachedFiles`, labelled hashed/unchanged | — |
 | Export bytes | `/details` subresource `status.progressDetails` | the ExportAction object — `progressDetails` and `actionDetails` are **null** there |
 | Export capacity | `progressDetails.totalBytes` is the **volume capacity** | not the data size; never a change-rate denominator |
+| What the data costs | `contentPhysicalBytes` (`content list`, live entries) | `objectBytes` "stored" (`blob list`) — the whole bucket including dead pack space, index and logs; measured 346.2 GiB stored against 105.4 GiB live, 70 % garbage, because Kopia never edits a pack in place and full maintenance had not kept up with failing hourly exports |
 
 Validation pairs on the reference cluster: `prod-test` / `calibrate-backup` (100,003
 files of 512 KB, known 20 % rewrite per cycle — all three change-rate methods return

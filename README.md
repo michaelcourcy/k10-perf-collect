@@ -137,13 +137,30 @@ plus any `*Pressure` condition. Usage comes from the kubelet stats summary
 back to the metrics API (`metrics.k8s.io`, CPU and memory only). It is one sample, not
 an average: run the generator while exports are in flight to see what they cost.
 
-Six properties of the data worth knowing before reading the JSON:
+Seven properties of the data worth knowing before reading the JSON:
 
 - **Every snapshot names its ExportAction** (`snapshots[].exportAction`, matched by time
   window); one without is flagged with `exportActionNote` — another policy or a run-now
   action exporting into the same repository, or retired action history. ExportActions
   are listed after the repositories are read, so an export that starts during a long run
   is not missing while its snapshot is present.
+
+- **`stored` is the bill, `content physical` is the data.** They come from two different
+  Kopia listings and routinely differ by several times. `objectBytes` ("stored") is
+  `kopia blob list` summed: every object in the bucket — data packs `p`, metadata packs
+  `q`, index blobs `x`, Kopia's own logs `_`, the format blob. `contentPhysicalBytes`
+  ("content physical") is `kopia content list` summed over live entries: the data *inside*
+  those packs, after compression and encryption. `contentLogicalBytes` is the same entries
+  before compression, and `dedup+compression` is physical ÷ logical.
+
+  Kopia never edits a pack in place, so superseded content keeps occupying its pack until a
+  **full maintenance** rewrites the survivors and deletes the old blobs. The gap
+  `stored − content physical` is therefore dead space awaiting reclamation, plus index and
+  logs. Measured on the reference cluster: 346.2 GiB stored (17,460 `p` blobs = 339.9 GiB,
+  plus 3.3 GiB `q`, 2.0 GiB `x`, 1.0 GiB logs) against 105.4 GiB of live content — **70 % of
+  the bucket was garbage**, because every failed export still uploads packs and the daily
+  maintenance could not keep up with an hourly export that failed. A ratio near 1.0 is
+  healthy; well above it means either maintenance is behind or exports are failing.
 
 - **Checkpoints are not snapshots.** While an export runs, Kopia writes an *incomplete*
   manifest every 45 minutes (its checkpoint interval) so an interrupted upload can

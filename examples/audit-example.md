@@ -263,11 +263,18 @@ lifting the ext4 inode ceiling that had capped the workload (finding 2 above).
 
 ### A second cost: the repository is four times the data
 
-`large-test` stores **336.0 GiB on S3 for a 47.7 GiB volume**, of which `content physical` is
-213.2 GiB. The ~123 GiB gap is pack objects written by attempts that died before their
-content was indexed — every failed export uploads for twenty-odd minutes and then loses the
-server. Kopia's full maintenance reclaims unreferenced packs, but it runs daily and the
-failures are hourly. Failing exports are not free.
+`large-test` stores **336.0 GiB on S3 for a 47.7 GiB volume** — and the two figures in the
+report mean different things. `stored` is `kopia blob list` summed: every object in the
+bucket, which is what you are billed for. `content physical` is `kopia content list` summed
+over live entries: the data actually inside those packs, after compression. Measured later
+the same day, when the repository had grown to 346.2 GiB stored: only **105.4 GiB was live
+content**, the rest dead pack space (238 GiB) plus 2 GiB of index and 1 GiB of Kopia's logs.
+
+Kopia never edits a pack in place, so superseded content keeps occupying it until a full
+maintenance rewrites the survivors. Here the last rewrite that did any work had run three
+days earlier and rewrote **0** contents, while hourly exports failed and uploaded packs
+throughout. A failed export still writes data: **70 % of that bucket was garbage.** Failing
+exports are not free.
 
 ### Recommendation: move the Kopia cache off the node
 
