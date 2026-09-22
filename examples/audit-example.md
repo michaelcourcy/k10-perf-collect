@@ -413,18 +413,28 @@ than discovering a rejected pod half an hour into the export you were trying to 
 | Override the `kopia-cache-volume` volume by name | **works** — `emptyDir` replaced by the PVC, K10's own mount untouched |
 | `k10-scc` patched to allow `ephemeral` | **required** — without it every worker pod is rejected and all backups fail |
 | Small policy end to end | **Complete**, one `<pod>-kopia-cache-volume` PVC per worker pod, created and deleted with it |
-| Five-million-file export | **40 minutes, 0 evictions, 2.2 GB transferred and rising** — every previous attempt was evicted within 21–34 minutes having transferred nothing |
+| Five-million-file export | **Complete in 96 minutes, 0 evictions, 11.5 GB transferred** — every previous attempt was evicted within 21–34 minutes having transferred nothing |
 
-The eviction is fixed. The export ran past forty minutes — comfortably beyond the 21–34
-minute band in which all four previous attempts died — with no eviction of any worker pod
-and a transfer rate climbing from 0.7 to 4.5 MB/s as Kopia got through the enumeration. It
-was still running when this was written, so the **end-to-end duration is not yet measured**;
-the first full export of this volume took 4.5 hours and there is no reason to expect much
-better, which is the argument for block mode below rather than for this fix.
+The eviction is fixed, end to end. The export completed in **96 minutes** with no eviction
+of any worker pod, moving 11.5 GB against a 47.7 GiB source — a 22.5 % change rate, which
+matches the 20 % churn built into the workload. Four prior attempts had died inside 21–34
+minutes having transferred nothing at all.
 
-One number to take from the PVC list while that ran: **six** cache PVCs bound at 50 GiB, or
-300 GiB provisioned, including one for the *block-mode* policy's upload pod — which does not
-need it. That is the blast radius in the last bullet above, visible in practice.
+The PVC lifecycle is clean: each `<pod>-kopia-cache-volume` claim is owned by its pod and
+deleted with it. No orphans were left behind.
+
+**But the memory did not move.** Peak datamover memory for this namespace was **6.9 GiB**,
+against 8.1 GiB for the filesystem-mode export before the fix. That is the point to
+understand about this remedy: the cache that was overflowing is Kopia's *on-disk* cache, and
+moving it to a PVC stops the kubelet evicting the pod for it. The directory tree Kopia holds
+in RAM while walking five million files is untouched, and these pods are still `BestEffort`
+with no limits (finding 4). One fix, one problem solved — the memory exposure is still
+there, and block mode is what removes it.
+
+Two further numbers from the run: six cache PVCs bound at 50 GiB, or **300 GiB
+provisioned**, including one for the *block-mode* policy's upload pod, which does not need
+it — the blast radius from the last bullet above, visible in practice. And 1,954 CPU-seconds
+over the 98-minute window, 0.33 cores on average: CPU was never the constraint.
 
 ### The cheaper fix: export the same volume in block mode
 
@@ -458,9 +468,10 @@ files, and every export Complete.*
 | Kopia tree | 5,000,003 files | 73,129 chunks of 1 MiB |
 | Index + metadata to cache | **4.66 GiB** | none — no per-file metadata |
 | First export | 4.5 h | 36.8 min |
-| Steady state | 11 min … then **4 failures** | 36.8 / 37.5 / 41.0 / 39.3 / 38.8 min, **all Complete** |
+| Steady state | 11 min … then **4 failures**; 96 min once the cache was fixed | 36.8 / 37.5 / 41.0 / 39.3 / 38.8 min, **all Complete** |
 | Objects on store | 17,945 · 336.0 GiB | 13,670 · 259.9 GiB |
-| Datamover peak memory | **8.1 GiB** (namespace) | **0.43–0.78 GiB** (whole cluster) |
+| Datamover peak memory | **8.1 GiB**, and **6.9 GiB** after the cache fix | **0.43–0.78 GiB** (whole cluster) |
+| Needs an SCC change, an override, 300 GiB of transient PVCs | to survive at all | no |
 
 The memory row is the one to read twice. The 8.1 GiB is what the filesystem-mode export of
 this volume cost on its own; the block-mode figures are the peak across **every** datamover
