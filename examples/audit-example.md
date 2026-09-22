@@ -164,6 +164,310 @@ filesystem mode, their upload buffers to that filesystem.
   readings, not estimates: run the same report again after switching a volume to block mode
   or moving a tier, and compare the same tables.
 
+## Follow-up, two days later: the same policy starts failing
+
+[Second report](export-topology-2026-09-22-14_12.html), 2026-09-22 12:10Z, same cluster.
+`large-test` went from five successful exports to **four consecutive failures**, while
+`prod-test` and `test-calibrate` — same policy, same profile, same hour — kept completing in
+under a minute.
+
+![large-test: five exports Complete then four Failed at 0 B, with prod-test below completing every hour](large-test-export-failures.png)
+
+*Same policy, same S3 profile, same hourly firing. Above: `large-test` failing at 0 B
+exported after ~30 minutes. Below: `prod-test` completing in ~1 minute.*
+
+### How it was found
+
+Five commands, in this order. Each one eliminated an explanation.
+
+1. **Compare the namespace against its siblings.** `calibrate-backup` selects three
+   namespaces; only one fails. That rules out the policy, the profile, the object store and
+   the credentials in a single step.
+
+   ```bash
+   for ns in large-test prod-test test-calibrate large-test-block; do
+     printf '%-18s ' "$ns"
+     kubectl -n $ns get exportactions.actions.kio.kasten.io -o json \
+       | jq -rc '[.items[].status.state] | group_by(.) | map("\(length) \(.[0])") | join(", ")'
+   done
+   ```
+
+   `large-test` 5 Complete / 4 Failed · the other three: Complete only. Note
+   `large-test-block` in that list — **the same data exported in block mode, 0 failures**.
+
+2. **Read the innermost cause, not the top-level message.** `status.error.message` says only
+   "Job failed to be executed"; the real cause is at the bottom of a nested `cause` chain
+   (guide 13):
+
+   ```
+   failed to open repository: unable to establish session ...
+   dial tcp 172.30.230.104:51515: connect: connection refused
+   ```
+
+   The `copy-vol-data` pod cannot reach the Kopia repository server. A different service IP
+   each time, so not a network policy — the server is simply not there.
+
+3. **Ask the kubelet why the server is not there.** The answer is in the events, not the logs:
+
+   ```bash
+   kubectl -n kasten-io get events --sort-by=.lastTimestamp -o json \
+     | jq -r '.items[] | select(.type=="Warning")
+              | select(.involvedObject.name|test("data-mover|copy-vol-data"))
+              | [(.lastTimestamp//"-"), .involvedObject.name, .reason, (.message[0:110])] | @tsv'
+   ```
+
+   ```
+   data-mover-svc-jw7pp  Evicted  Usage of EmptyDir volume "kopia-cache-volume" exceeds the limit "3000Mi"
+   copy-vol-data-jmdhx   Failed   Error: context deadline exceeded
+   ```
+
+   **13 evictions per hour**, every hour. `data-mover-svc` *is* the Kopia repository server;
+   the kubelet evicts it for overrunning its cache volume, and the export dies with it.
+
+4. **Measure what the cache has to hold.** Connect read-only to the repository (guide 12
+   step 4) and size the index:
+
+   ```bash
+   kopia_exec 'kopia blob list --json' > blobs.json
+   jq -r '[.[] | {p:(.id[0:1]), l:.length}] | group_by(.p)
+          | map({prefix:.[0].p, count:length, MiB:((map(.l)|add)/1048576*10|round/10)}) | .[]' blobs.json
+   ```
+
+   | Blob class | Blobs | Size |
+   |---|---:|---:|
+   | `x` index | 371 | 1,531 MiB |
+   | `q` metadata packs | 211 | 3,238 MiB |
+   | **index + metadata** | **582** | **4,769 MiB ≈ 4.66 GiB** |
+   | `p` data packs | 16,929 | 337.7 GiB |
+
+   Against `k10DataStoreTotalCacheSizeLimitMB = 3000`. **The repository's index no longer
+   fits in the datamover's cache volume.** Five million files of 10 KiB generate 4.66 GiB of
+   directory metadata and index; the server must read it to do incremental deduplication,
+   into a 3 GiB `emptyDir` with a hard `sizeLimit`. This is arithmetic, not tuning.
+
+5. **Explain why it worked on Sunday and not on Tuesday.** The snapshot history says it:
+
+   | Date | Files | Hashed | Result |
+   |---|---:|---:|---|
+   | 09-20 02:48 | 4,849,653 | all | Complete, 4.5 h, 48.7 GiB |
+   | 09-21 ×3 | 5,000,003 | 0 | Complete, 11–13 min, 173 B |
+   | 09-21 07:01 | 5,000,003 | 116,373 | Complete, 23 min, 2.0 GiB |
+   | 09-22 ×4 | — | — | **Failed, 0 B** |
+
+   The first export *built* the index as it went, so there was nothing to load. Now five
+   snapshots of five million files exist and the accumulated index exceeds the cache on every
+   session. **It does not self-correct: each new snapshot makes it worse.**
+
+The file count moved from 4,849,653 to 5,000,003 because the PVC was expanded 74 → 81 GiB,
+lifting the ext4 inode ceiling that had capped the workload (finding 2 above).
+
+### A second cost: the repository is four times the data
+
+`large-test` stores **336.0 GiB on S3 for a 47.7 GiB volume**, of which `content physical` is
+213.2 GiB. The ~123 GiB gap is pack objects written by attempts that died before their
+content was indexed — every failed export uploads for twenty-odd minutes and then loses the
+server. Kopia's full maintenance reclaims unreferenced packs, but it runs daily and the
+failures are hourly. Failing exports are not free.
+
+### Recommendation: move the Kopia cache off the node
+
+The cache volume is an `emptyDir` with a hard `sizeLimit`, so it fails twice over: it caps
+the cache at a size the workload has outgrown, and what it does hold counts against the
+node's ephemeral storage — the same filesystem that finding 6 shows at 82–83 % on two nodes.
+A generic ephemeral volume — a PVC created and destroyed with the pod — fixes both.
+
+K10 applies a pod spec patch to **all Kanister job pods** from a ConfigMap named
+`pod-spec-override` in the K10 namespace
+([documentation](https://docs.kasten.io/latest/kanister/override/)). Nothing refers to it:
+creating the ConfigMap is enough, and K10 picks it up on the next job pod with no Helm
+upgrade, no CR edit and no restart.
+
+There are three steps, and the first two are where this goes wrong.
+
+#### Step 1 — override the volume by name, do not add a mount
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-spec-override
+  namespace: kasten-io
+data:
+  override: |
+    kind: Pod
+    spec:
+      volumes:
+        - name: kopia-cache-volume        # the EXISTING volume, replaced by name
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  kopia: cache-volume
+              spec:
+                accessModes: [ "ReadWriteOnce" ]
+                storageClassName: "managed-csi"
+                resources:
+                  requests:
+                    storage: 50Gi
+```
+
+The datamover mounts two `emptyDir`s — `tmp-volume` at `/tmp` with no limit, and
+`kopia-cache-volume` at `/tmp/kopia-cache` with `sizeLimit: 3000Mi`. Only the nested one is
+evicted, so the override has to reach *that* volume.
+
+The instinct is to add a volume of your own plus a `volumeMounts` entry pointing at
+`/tmp/kopia-cache`. **That does not work**: K10 *appends* to `volumeMounts` rather than
+merging on `mountPath`, and the pod is rejected outright —
+
+```
+Pod "data-mover-svc-2tr6j" is invalid:
+  spec.containers[0].volumeMounts[3].mountPath: Invalid value: "/tmp/kopia-cache": must be unique
+```
+
+Mounting at `/tmp` instead collides with `tmp-volume` the same way. `volumes`, however, *is*
+merged by `name` — so declaring `kopia-cache-volume` with an `ephemeral` source replaces the
+`emptyDir` in place, K10's own mount at `/tmp/kopia-cache` is left untouched, and no
+`volumeMounts` stanza is needed at all.
+
+#### Step 2 — on OpenShift, let the SCC admit ephemeral volumes
+
+K10 ships its own `k10-scc`, and its allowed volume list does not include `ephemeral`:
+
+```console
+$ kubectl get scc k10-scc -o jsonpath='{.volumes}'
+["configMap","downwardAPI","emptyDir","persistentVolumeClaim","projected","secret"]
+```
+
+Until it does, **every** worker pod is rejected at admission — the metadata export too, so
+all backups fail, not just the large one:
+
+```
+pods "data-mover-svc-" is forbidden: unable to validate against any security context
+constraint: spec.volumes[0]: Invalid value: "ephemeral": ephemeral volumes are not allowed
+to be used
+```
+
+```console
+$ kubectl get scc k10-scc -o json > k10-scc-backup.json      # keep a way back
+$ kubectl patch scc k10-scc --type=json \
+    -p '[{"op":"add","path":"/volumes/-","value":"ephemeral"}]'
+securitycontextconstraints.security.openshift.io/k10-scc patched
+```
+
+This is a change to a security control, so treat it as one: it widens the volume types K10's
+service accounts may use, cluster-wide for those accounts. It is scoped to K10's own SCC
+rather than `restricted-v2`, which is the reason to patch `k10-scc` and not the shared one.
+Get it agreed before applying, and expect a hand edit to be reverted on the next operator
+reconcile or chart upgrade — the durable form is a chart value, not `kubectl patch`.
+
+**If the SCC change is not acceptable**, do not reach for a pre-created
+`persistentVolumeClaim` instead. It is in the allowed list, but one PVC shared by every
+Kanister job pod means concurrent Kopia caches writing into the same volume with no
+isolation and nothing to clean them up — and on `ReadWriteOnce` the second pod simply will
+not schedule. The per-pod lifecycle is the point of the ephemeral volume, not an incidental
+detail.
+
+The two real alternatives are:
+
+- **Export the volume in block mode.** No per-file metadata, so no index to cache, so the
+  problem does not exist. This is the better answer even where the SCC *can* be changed.
+- **Raise the cache ceiling and keep it on the node.** The `emptyDir` `sizeLimit` is
+  `3000Mi` and `k10DataStoreTotalCacheSizeLimitMB` is `3000`; the two track each other, so
+  raising the setting is the obvious route that needs no SCC change and no override at all.
+  Confirm on your own cluster that a new worker pod's `sizeLimit` follows the value before
+  relying on it. The cost is that the cache stays on the node's root filesystem: 8 GiB per
+  pod × `K10LimiterSnapshotExportsPerCluster` (10) is 80 GiB of ephemeral storage during a
+  busy window, on nodes this report already shows at 82–83 %. That trades an eviction for
+  `sizeLimit` against an eviction for node disk pressure — which is precisely why moving the
+  cache onto a PVC is the more durable fix.
+
+#### Step 3 — verify on something small first
+
+```console
+$ kubectl -n kasten-io get pvc -l kopia=cache-volume
+NAME                                                                  STATUS    STORAGECLASS
+repo-access-kopia-volumedata-repository-98v2rkz7sx-kopia-cache-volume Pending   managed-csi
+repo-access-kopia-metadata-repository-sv6qxrvbvd-kopia-cache-volume   Pending   managed-csi
+```
+
+One PVC per worker pod, named `<pod>-kopia-cache-volume`, created and deleted with it. A
+run of the smallest policy confirms admission and binding in under a minute — much cheaper
+than discovering a rejected pod half an hour into the export you were trying to fix.
+
+#### Sizing and blast radius
+
+- **Size against the index, not the volume.** 4.66 GiB today and growing with every
+  snapshot; 50 GiB leaves room. `k10DataStoreTotalCacheSizeLimitMB` (3000) stays as Kopia's
+  own soft budget — raise it too, or Kopia keeps sweeping a cache that now has room.
+- **It applies to every Kanister job pod on the cluster.** 50 GiB per datamover ×
+  `K10LimiterSnapshotExportsPerCluster` (10) is 500 GiB of provisioned disk during a busy
+  window, and it adds a PVC create/attach/delete cycle to every small export too. Scope it
+  with an `ActionPodSpec` binding if only one namespace needs it.
+
+#### What was verified on this cluster
+
+| Step | Result |
+|---|---|
+| ConfigMap picked up with no Helm/CR change, no restart | **yes** — the next worker pod carried the patched spec |
+| Override by `volumeMounts` at `/tmp/kopia-cache` | **rejected** — `mountPath ... must be unique`; K10 appends rather than merging on path |
+| Override the `kopia-cache-volume` volume by name | **works** — `emptyDir` replaced by the PVC, K10's own mount untouched |
+| `k10-scc` patched to allow `ephemeral` | **required** — without it every worker pod is rejected and all backups fail |
+| Small policy end to end | **Complete**, one `<pod>-kopia-cache-volume` PVC per worker pod, created and deleted with it |
+| Five-million-file export | 50 GiB cache PVCs bound, **0 evictions**, bytes moving — where every previous attempt sat at 0 bytes and was evicted within 21–34 minutes |
+
+The last row was still in flight when this was written: the export had passed sixteen
+minutes with no eviction and 294 MB transferred, against four prior attempts that
+transferred nothing at all before dying. Treat the eviction as fixed and the end-to-end
+duration as not yet measured.
+
+### The cheaper fix: export the same volume in block mode
+
+This cluster runs the controlled experiment already. `large-test-block` holds **the same
+five million 10 KiB files**, on the same storage class, at the same 81 GiB, exported by an
+identical hourly policy to the same S3 profile. The two PVCs differ in exactly one thing:
+
+```console
+$ kubectl -n large-test-block get pvc calibrate-5000k-10kb \
+    -o jsonpath='{.metadata.annotations}' | jq
+{
+  "k10.kasten.io/pvc-export-volume-in-block-mode": "force",
+  ...
+}
+```
+
+Note `volumeMode: Filesystem` on **both** PVCs. This is not a block-mode volume — it is an
+ordinary filesystem PVC that K10 has been told to export as a block device. K10 clones the
+CSI snapshot and exports the clone's raw device, so the file count and the directory layout
+stop mattering: there is no per-file metadata, no index to cache, and no SELinux relabel of
+five million inodes before the container starts.
+
+![large-test-block: six exports, all Complete in 36-41 minutes, the PVC stored as 73,129 chunks of 1 MiB](large-test-block-mode.png)
+
+*The same five million files, exported in block mode: 73,129 chunks of 1 MiB instead of
+files, and every export Complete.*
+
+| | filesystem mode (`large-test`) | block mode (`large-test-block`) |
+|---|---|---|
+| PVC | `volumeMode: Filesystem` | `volumeMode: Filesystem` **+ the annotation** |
+| Kopia tree | 5,000,003 files | 73,129 chunks of 1 MiB |
+| Index + metadata to cache | **4.66 GiB** | none — no per-file metadata |
+| First export | 4.5 h | 36.8 min |
+| Steady state | 11 min … then **4 failures** | 36.8 / 37.5 / 41.0 / 39.3 / 38.8 min, **all Complete** |
+| Objects on store | 17,945 · 336.0 GiB | 13,670 · 259.9 GiB |
+| Datamover peak memory | **8.1 GiB** (namespace) | **0.43–0.78 GiB** (whole cluster) |
+
+The memory row is the one to read twice. The 8.1 GiB is what the filesystem-mode export of
+this volume cost on its own; the block-mode figures are the peak across **every** datamover
+on the cluster during each of three block exports — an upper bound, and still an order of
+magnitude lower. Kopia holds the directory tree it is building in memory, and block mode has
+no tree to hold.
+
+Block mode reads the whole device every time (76.7 GB at ~37 MB/s), so it does not get the
+"nothing changed, finish in 11 minutes" case that filesystem mode enjoys when it works.
+That is the trade: a predictable 40 minutes every hour instead of 11 minutes when lucky and
+a failure when not. For a five-million-file volume that is the better bargain, and it needs
+no SCC change, no pod override and no extra storage — one annotation on the PVC.
+
 ---
 
 Generated from `generate-export-topology.py` / `render-export-topology.py`
