@@ -191,15 +191,44 @@ data-end only, status colours always paired with a label, and every chart has a 
 view. Screenshot it headless before shipping a layout change:
 `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --screenshot=out.png file:///path.html`.
 
-`repo_checker -r inventory` aborts the WHOLE inventory on the first repository whose
-Location Profile was deleted ("failed to find a profile with given location
-information"). k10tools has no continue-on-error; only `-p profile` and `-R repository`
-filters, and every invocation re-scans the catalog (64k refs on a lab cluster, plus a
-340k-entry "backstop scan" when a repository has orphaned snapshots), so per-repository
-runs are expensive. The generator therefore discovers scope from the **export policies**
-(`policy_targets`, a Python port of `lib/policies.sh`) and treats the inventory as
-best-effort enrichment: full -> per profile, orphans reported under
-`orphanedRepositories`. `storagerepositories.repositories.kio.kasten.io` (85 on a lab
+### Scope comes from the cluster APIs; repo_checker is enrichment only
+
+`repo_checker -r inventory` aborts the WHOLE inventory on the first repository it cannot
+open - `buildAllInventories` (`repository_inventory_list_ops.go:147`) has no
+continue-on-error. **`-p profile` does not rescue it**: measured on the reference cluster
+with a deleted policy, full, `-p <that profile>` and `-R <the broken repository>` all exit
+1, and only `-R <a healthy repository>` returns JSON. Every invocation re-scans the catalog
+(64k refs on a lab cluster, plus a 340k-entry "backstop scan" when a repository has
+orphaned snapshots), so per-repository runs are a last resort.
+
+Scope is therefore computed **before repo_checker is touched**, from three cluster APIs
+that cannot fail, and a failed inventory never shrinks the report:
+
+| Question | Source | Sees |
+|---|---|---|
+| what WILL be exported | export policies (`policy_targets`) | a namespace selected but never yet exported |
+| what HAS been exported | `restorepointcontents` (`exported_history`) | data whose policy or namespace is deleted |
+| where it lives | `storagerepositories` | repository name, owning namespace, profile, bucket/path |
+
+Neither of the first two contains the other; the union is the scope. On the reference
+cluster after deleting one policy and three namespaces: 3 pairs from the policies, **4 more
+from the history**, all still readable because the profile survived.
+
+`restorepointcontents` is **cluster-scoped** and survives the namespace. Filter on the
+`k10.kasten.io/exportProfile` label - without it you also get backup-only restore points
+(54 of 101 on the reference cluster), which have no object-store data at all.
+
+Three tiers of orphan, by what is still possible:
+
+| Gone | Detected from | Openable | Reported as |
+|---|---|---|---|
+| policy | RPC labels | yes | a normal namespace entry with `orphan.orphanedBy` |
+| namespace | RPC labels | yes | same |
+| **profile** | RPC + SR | **no** - it holds the credentials and the repository password | `repositoriesWithoutAProfile`, location and restore-point count only |
+
+The inventory escalation when a profile-wide run fails is `-R <repository>` per repository
+from the `StorageRepository` list, skipping the one that aborted. Orphans are reported
+under `orphanedRepositories`. `storagerepositories.repositories.kio.kasten.io` (85 on a lab
 cluster; empty on the reference cluster) carries per repository the owning namespace (label
 `k10.kasten.io/appName`), the profile (label `k10.kasten.io/exportProfile`),
 `status.contentType` (metadata/volumedata) and `status.location` (bucket, store type,
@@ -253,6 +282,7 @@ Do not re-derive these; do not contradict them without re-testing.
 | Empty VM disks | A blank DataVolume disk exports as a block-mode snapshot with 0 chunks / `summ.fileSize` 0 although the PVC requests GiBs. Correct data - render it as "empty disk", not `0 B`. |
 | Concurrent PVC exports | Disks of one VM are exported at the same time, so their snapshot windows overlap and a content block can fall in several. `assign_contents` picks the nearest window and reports the overlapping bytes as `physicalIngestAmbiguousBytes`; the renderer shows `~`. Namespace/export-level figures are unaffected. |
 | ExportActions | Per-application exports live in the **application namespace** (`scheduled-*`, labels `policyName`, `exportProfile`, `runActionName`); the ones in the K10 namespace are the run's metadata export (`isMetadataExport=true`, no bytes). Byte counters (`status.progressDetails`: `totalBytes` = capacity, `readBytes`, `processedBytes`, `transferredBytes`, `processingRate`) and per-volume `phases[].volumeOperations` (pvcName, dataFormat, exportDirective, snapshotId) exist **only** on `GET …/exportactions/<name>/details`, ~0.8 s and ~700 KB each. |
+| K10 aggregated APIs and `/details` | The object is a thin shell; the payload is on the `/details` subresource. True for **ExportActions** (`progressDetails`/`actionDetails` null on the object) and for **RestorePointContents** (`kubectl get -o yaml` shows `state: Unbound` and an empty `restorePointRef` - it looks like a stub and is not). `GET /apis/apps.kio.kasten.io/v1alpha1/restorepointcontents/<name>/details` returns ~430 KB: per artifact `pvcName`, `storageClassName`, `location.objectStore`, `profileRef`, `storageUsage.{logical,physical,count}`, `uploadEndTime`, and `meta.kanister.values[]` with `backupIdentifier` (the Kopia snapshot id), `objectStorePath`, `fileCount`, `size`, `phySize` - plus the Kubernetes manifests. Cluster-scoped, so it survives the namespace. Check `/details` before concluding a K10 object carries nothing. |
 | `kubectl exec -i` + stdin | Feeding the script on stdin (`sh -s`) intermittently truncates or garbles large stdout (a 100 KB `kopia … --json` broke mid-document). Pass the command as an argument: `kubectl exec pod -- sh -c '…'`. |
 | Node usage | `GET /api/v1/nodes/<n>/proxy/stats/summary` returns CPU (`node.cpu.usageNanoCores`), memory (`node.memory.workingSetBytes/availableBytes`) and the root fs (`node.fs.usedBytes/capacityBytes`, = ephemeral storage) in one call; `metrics.k8s.io` gives CPU/memory only (10 s window). Node `status.capacity["ephemeral-storage"]` is in Ki, `allocatable` in plain bytes - parse quantities, do not compare strings. |
 | Collection skew | The run reads cluster objects first and repositories minutes later; an export that starts in between has its Kopia snapshot but no ExportAction in the JSON (seen: 4 snapshots, 3 actions). ExportActions are therefore listed **after** `_read_repositories`, and each snapshot carries `exportAction` (window match) or `exportActionNote`. |

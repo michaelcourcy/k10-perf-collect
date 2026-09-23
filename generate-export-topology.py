@@ -598,6 +598,132 @@ def enrich_orphans(kube, orphans, profiles, cluster_uid=None):
     return orphans
 
 
+def exported_history(kube):
+    """What HAS been exported, from two cluster-scoped K10 APIs that survive the deletion of
+    the policy, the namespace and the application.
+
+    `policy_targets` answers the forward question - what a live export policy selects - and
+    is blind to data whose policy or namespace is gone. That data is still on the object
+    store and still costing money, so it has to be discovered from history instead:
+
+      restorepointcontents   cluster-scoped, one per restore point, carrying the
+                             appNamespace / policyName / exportProfile labels. The
+                             exportProfile label is what separates an EXPORT from a
+                             backup-only snapshot (54 of 101 had no export on the reference
+                             cluster). Its /details subresource additionally holds the PVC,
+                             the Kopia snapshot id, the sizes and the Kubernetes manifests -
+                             not needed for discovery, but the only way to describe a
+                             repository whose PROFILE is gone and which therefore cannot be
+                             opened at all.
+      storagerepositories    one per Kopia repository, with the owning namespace
+                             (k10.kasten.io/appName), the profile and status.location.
+
+    Returns (triples, repos) where triples maps (namespace, policy, profile) to the restore
+    points seen for it, and repos maps (namespace, profile) to the StorageRepository facts."""
+    rpcs = (kube.get("restorepointcontents.apps.kio.kasten.io") or {"items": []})["items"]
+    crs = (kube.get("storagerepositories.repositories.kio.kasten.io", ns=kube.k10ns) or {"items": []})["items"]
+
+    triples = {}
+    for r in rpcs:
+        lab = r["metadata"].get("labels") or {}
+        prof = lab.get("k10.kasten.io/exportProfile")
+        ns = lab.get("k10.kasten.io/appNamespace") or lab.get("k10.kasten.io/appName")
+        if not prof or not ns:
+            continue  # backup-only restore point: no export, nothing on an object store
+        key = (ns, lab.get("k10.kasten.io/policyName") or "-", prof)
+        t = triples.setdefault(key, {"restorePoints": 0, "oldest": None, "newest": None, "names": []})
+        t["restorePoints"] += 1
+        ts = r["metadata"].get("creationTimestamp")
+        if ts:
+            t["oldest"] = min(t["oldest"] or ts, ts)
+            t["newest"] = max(t["newest"] or ts, ts)
+        if len(t["names"]) < 200:
+            t["names"].append(r["metadata"]["name"])
+
+    repos = {}
+    for c in crs:
+        lab = c["metadata"].get("labels") or {}
+        st = c.get("status") or {}
+        ns, prof = lab.get("k10.kasten.io/appName"), lab.get("k10.kasten.io/exportProfile")
+        if not ns or not prof:
+            continue
+        store = ((st.get("location") or {}).get("objectStore") or {})
+        repos[(ns, prof)] = {"repository": c["metadata"]["name"], "contentType": st.get("contentType"),
+                             "bucket": store.get("name"), "path": store.get("path"),
+                             "objectStoreType": store.get("objectStoreType"), "region": store.get("region"),
+                             "fileStore": (st.get("location") or {}).get("fileStore")}
+    return triples, repos
+
+
+def restore_points_from_details(kube, names, max_n=40):
+    """Describe an unopenable export from restorepointcontents/<name>/details alone.
+
+    `repo_checker -o connect -a <namespace>` resolves the repository from the LIVE namespace
+    UID, so once the namespace is deleted the repository cannot be opened at all - measured:
+    "Failed to get application namespace UID -> namespaces \"large-test\" not found". A gone
+    profile blocks it for a different reason (no credentials). In both cases the /details
+    subresource is the only remaining description of the data, and it is a good one: per
+    restore point and per PVC it carries the PVC name, its storage class, the Kopia snapshot
+    id, the file count, the logical and physical sizes and the upload time.
+
+    Returns per-PVC rows shaped like the Kopia-derived ones so the report reads the same."""
+    by_pvc = {}
+    fetched = errors = 0
+    for n in names[:max_n]:
+        r = kube.run("get", "--raw",
+                     f"/apis/apps.kio.kasten.io/v1alpha1/restorepointcontents/{n}/details",
+                     check=False, timeout=120)
+        if r.returncode != 0 or not r.stdout.strip():
+            errors += 1
+            continue
+        try:
+            d = json.loads(r.stdout)
+        except ValueError:
+            errors += 1
+            continue
+        fetched += 1
+        for a in (((d.get("status") or {}).get("restorePointContentDetails") or {}).get("artifacts") or []):
+            kan = ((a.get("meta") or {}).get("kanister") or {})
+            vol = ((kan.get("meta") or {}).get("k8sVolume") or {})
+            pvc = vol.get("pvcName")
+            if not pvc:
+                continue
+            vals = {v.get("key"): v.get("value") for v in (kan.get("values") or [])}
+            usage = (kan.get("meta") or {}).get("storageUsage") or {}
+            e = by_pvc.setdefault(pvc, {"name": pvc, "storageClass": vol.get("storageClassName"),
+                                        "existsOnCluster": False, "snapshots": [],
+                                        "source": "restorepointcontent details"})
+            def _int(x):
+                try:
+                    return int(x)
+                except (TypeError, ValueError):
+                    return None
+            e["snapshots"].append({
+                "restorePointContent": n,
+                "endTime": (kan.get("meta") or {}).get("uploadEndTime"),
+                "kopiaSnapshotId": vals.get("backupIdentifier"),
+                "objectStorePath": vals.get("objectStorePath"),
+                "fileCount": _int(vals.get("fileCount")),
+                "totalSizeBytes": usage.get("logical"),
+                "physicalBytes": usage.get("physical"),
+                "sizeText": vals.get("size"), "physicalText": vals.get("phySize")})
+    out = []
+    for e in by_pvc.values():
+        e["snapshots"].sort(key=lambda x: x.get("endTime") or "")
+        last = e["snapshots"][-1] if e["snapshots"] else {}
+        e.update({"snapshotCount": len(e["snapshots"]), "fileCount": last.get("fileCount"),
+                  "totalSizeBytes": last.get("totalSizeBytes"),
+                  "lastSnapshotTime": last.get("endTime"),
+                  "averageFileSizeBytes": (int(last["totalSizeBytes"] / last["fileCount"])
+                                           if last.get("fileCount") and last.get("totalSizeBytes") else None),
+                  "mode": None, "sizeHistogram": {"skipped": "repository cannot be opened; "
+                                                             "described from restore point details"}})
+        out.append(e)
+    out.sort(key=lambda x: x["name"])
+    return out, {"restorePointsRead": fetched, "restorePointsFailed": errors,
+                 "restorePointsAvailable": len(names)}
+
+
 # --------------------------------------------------------------------------- repo_checker
 
 class ConnectError(RuntimeError):
@@ -774,10 +900,18 @@ class RepoChecker:
                     o[{"name": "bucket"}.get(k, k)] = mm.group(1)
         return o
 
-    def inventory(self, profile_names, full=True):
+    def inventory(self, profile_names, full=True, repos_by_profile=None, per_repository=False):
         """Full inventory when it works; otherwise one inventory per existing profile,
-        merged. Repositories whose profile is gone cannot be listed at all by repo_checker
-        and are returned separately as orphans. A focused run (--namespace/--policy) passes
+        merged. Repositories k10tools cannot open are returned separately as orphans.
+
+        The per-profile fallback is partial, not a fix: k10tools aborts the whole inventory
+        on the first repository it cannot open, and `-p <profile>` aborts the same way when
+        that repository is on that profile. Measured on the reference cluster with a deleted
+        policy: full, `-p`, and `-R <the broken repository>` all exit 1; only
+        `-R <a healthy repository>` returns JSON, which is the escalation below.
+
+        Scope therefore never depends on this: it comes from the export policies and from
+        the exported history (exported_history). A focused run (--namespace/--policy) passes
         only the profiles it needs and full=False: every inventory re-scans the whole
         catalog, so eight of them cost nine minutes for a single pair on a lab cluster."""
         orphans = []
@@ -789,9 +923,13 @@ class RepoChecker:
             o = self._orphan_from_error(out)
             if o:
                 orphans.append(o)
-                warn(f"repository {o['repository']} references a deleted Location Profile "
-                     f"({o.get('bucket', '?')}/{o.get('path', '?')}); repo_checker aborts the full inventory on it - "
-                     f"falling back to one inventory per profile")
+                warn(f"repository {o['repository']} cannot be opened by k10tools, which aborts the "
+                     f"WHOLE inventory on it (buildAllInventories has no continue-on-error) - "
+                     f"falling back to one inventory per profile. Note this only helps when the "
+                     f"broken repository is on a DIFFERENT profile: measured on the reference "
+                     f"cluster, -p on the same profile aborts identically and only "
+                     f"-R <healthy repository> gets through. The pair is still reported from the "
+                     f"exported history. See orphanedRepositories for the cause.")
             else:
                 warn("full inventory produced no JSON; falling back to one inventory per profile. Tail:\n" + out[-800:])
         merged = {"repositories": [], "timestamp": None}
@@ -805,8 +943,40 @@ class RepoChecker:
                 o = self._orphan_from_error(out)
                 if o and o not in orphans:
                     orphans.append(o)
+                bad = o["repository"] if o else None
                 warn(f"inventory for profile {prof} produced no JSON" +
-                     (f" - k10tools cannot match repository {o['repository']} to a profile" if o else ""))
+                     (f" - k10tools cannot open repository {bad} and aborts the profile "
+                      f"with it" if bad else ""))
+                # Escalate to one inventory per repository. `-R` is the only filter that
+                # survives a broken repository: measured on the reference cluster, full and
+                # `-p` both exit 1 while `-R <a healthy repository>` returns JSON. Costs one
+                # catalog re-scan each, so it is a last resort, not the default.
+                names = [n for n in (repos_by_profile or {}).get(prof, []) if n != bad]
+                if not names:
+                    continue
+                if not per_repository:
+                    # Each one re-scans the whole catalog (~45 s on the reference cluster), and
+                    # all it adds is the orphan/dangling/not-synced counts - the repository
+                    # names and locations are already in the StorageRepository CRs, and the
+                    # scope does not depend on any of it. Opt in with --inventory-per-repository.
+                    log(f"  skipping the per-repository fallback for {prof}: {len(names)} "
+                        f"repositories x one catalog re-scan each. It would only add orphan and "
+                        f"dangling counts; pass --inventory-per-repository to collect them.")
+                    continue
+                log(f"  escalating to {len(names)} per-repository inventories on {prof} ...")
+                got = 0
+                for name in sorted(names):
+                    out_r = self._run("-r", "inventory", "-F", "json", "-p", prof,
+                                      "-R", name, "-n", self.kube.k10ns)
+                    js_r = self._extract_json(out_r)
+                    if js_r is None:
+                        o_r = self._orphan_from_error(out_r)
+                        if o_r and o_r not in orphans:
+                            orphans.append(o_r)
+                        continue
+                    merged["repositories"].extend(js_r.get("repositories") or [])
+                    got += 1
+                log(f"  {got}/{len(names)} repositories on {prof} inventoried individually")
                 continue
             merged["repositories"].extend(js.get("repositories") or [])
             merged["timestamp"] = js.get("timestamp") or merged["timestamp"]
@@ -1226,22 +1396,13 @@ def collect(args):
         if prom.available:
             log(f"metrics: {prom.url} ({prom.flavour}), retention ~{(prom.retention_seconds or 0)//86400} d")
 
-    # ---- inventory: what actually exists in the repositories -------------------------------
-    workdir = tempfile.mkdtemp(prefix="export-topology-")
-    # Default to the registry K10 itself pulls from: on an enterprise cluster that one is
-    # whitelisted or mirrored, gcr.io usually is not. gcr.io/kasten-images only when K10's
-    # registry cannot be read or when asked for explicitly.
-    detected = k10_image_registry(k10cfg)
-    if args.image_registry in (None, "auto"):
-        registry = detected or "gcr.io/kasten-images"
-        origin = "the registry K10 pulls from" if detected else "repo_checker default, K10's registry not readable from k10-config"
-    else:
-        registry, origin = args.image_registry, "--image-registry"
-    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
-    rc.detected_registry = detected
-    log(f"repo_checker images: {registry}/k10tools:{args.image_tag or ver}  ({origin})")
-
-    # ---- scope: which (namespace, profile) pairs to read, from two independent sources ----
+    # ---- scope, from the cluster APIs alone. repo_checker is NEVER consulted here: it is
+    #      the one component that can abort, and a failed inventory must not shrink the
+    #      report. Two complementary questions, and neither answer contains the other:
+    #        what WILL be exported   export policies      (policy_targets)
+    #        what HAS been exported  restorepointcontents (exported_history)
+    #      A namespace selected but never yet exported appears only in the first; data whose
+    #      policy or namespace has been deleted appears only in the second.
     # 1. the export policies (the scope rule; never depends on repo_checker)
     excluded = {x.strip() for x in (k10cfg.get("excludedApps") or "").split(",") if x.strip()}
     all_ns = (kube.get("namespaces") or {"items": []})["items"]
@@ -1276,19 +1437,130 @@ def collect(args):
     log(f"scope from export policies: {len(targets)} namespace/profile pairs "
         f"({len(skipped_no_rp)} selected namespaces have no restore point and were skipped)")
 
-    # 2. the repository inventory, when repo_checker can produce one (catches data whose
-    #    policy has since been deleted, and adds repository names, orphan counts, ...)
+    # 1b. what HAS been exported, from the cluster-scoped history. A policy or a namespace
+    #     that has been deleted takes its pair out of policy_targets - and out of the
+    #     namespaced RestorePoint filter above - while the Kopia repository and everything
+    #     in it stay on the object store. Those are added here so the report still describes
+    #     them; they are connected and read exactly like a live pair, because the profile
+    #     (the credentials) is what a connect actually needs.
+    with Step("exported restore points and storage repositories", indent=2) as st:
+        hist_triples, hist_repos = exported_history(kube)
+        st.note = f"{len(hist_triples)} namespace/policy/profile triples exported historically"
+    orphan_pairs = {}
+    for (ns, pol, prof), info in sorted(hist_triples.items()):
+        if args.namespace and ns not in args.namespace:
+            continue
+        if args.policy and pol not in args.policy:
+            continue
+        if ns == kube.k10ns:
+            continue
+        gone = []
+        if pol != "-" and pol not in policies:
+            gone.append("policy")
+        if ns not in {n["metadata"]["name"] for n in all_ns}:
+            gone.append("namespace")
+        if not gone:
+            continue  # still live: policy_targets already has it, or it is simply not selected any more
+        cr = hist_repos.get((ns, prof))
+        # A frozen entry, not a live one: with the policy or the namespace gone nothing will
+        # export here again, so the newest restore point is the date the data stopped moving.
+        # Everything else in this namespace's section - sizes, file counts, change rates - is
+        # history as of that date and will not change.
+        info = dict(info, orphanedBy=gone, policy=pol, profileExistsOnCluster=prof in profiles,
+                    storageRepository=cr, frozenSince=info.get("newest"),
+                    note=("no longer exported: the " + " and ".join(gone) +
+                          " no longer exists, so this namespace is frozen at its last restore "
+                          "point and the figures below are history, not a current state. The "
+                          "data still occupies the object store."))
+        if (ns, prof) in targets:
+            targets[(ns, prof)]["orphan"] = info
+            continue
+        orphan_pairs[(ns, prof)] = info
+        targets[(ns, prof)] = {"repo": None, "policies": {pol} if pol != "-" else set(),
+                               "inv_snaps": [], "source": "restorepointcontent", "orphan": info}
+    # The StorageRepository CR names every repository and gives its location. Attach it to
+    # every pair, live or orphaned: when repo_checker's inventory aborts, this is what keeps
+    # the repository name in the report instead of a blank.
+    for k, v in targets.items():
+        v["cr"] = hist_repos.get(k)
+    if orphan_pairs:
+        for (ns, prof), info in sorted(orphan_pairs.items()):
+            warn(f"{ns}/{prof}: exported {info['restorePoints']} restore points by policy "
+                 f"{info['policy']} but the {' and '.join(info['orphanedBy'])} no longer exists"
+                 + ("" if info["profileExistsOnCluster"] else
+                    f"; profile {prof} is gone too, so the repository cannot be opened"))
+        log(f"scope from exported history: {len(orphan_pairs)} further pairs whose policy or "
+            f"namespace is gone - their data is still on the object store")
+
+    # A pair whose PROFILE is gone cannot be opened at all - the profile holds the
+    # credentials and the repository password - so do not spend a k10tools run on it.
+    # Report it from history instead: the restore point count, the object-store location
+    # from the StorageRepository CR, and (a later step) the PVCs and Kopia snapshot ids
+    # from each restorepointcontents/<name>/details.
+    # Two reasons a pair cannot be OPENED, both fatal to repo_checker and neither fatal to
+    # the report: the namespace is gone (connect resolves the repository from the live
+    # namespace UID - "Failed to get application namespace UID"), or the profile is gone
+    # (no credentials, no repository password). Describe those from the restore point
+    # details instead of paying for a connect that cannot succeed.
+    unopenable = {}
+    for k, v in list(targets.items()):
+        o = v.get("orphan")
+        if not o:
+            continue
+        why = []
+        if "namespace" in o["orphanedBy"]:
+            why.append("the namespace is gone, so repo_checker cannot resolve the repository "
+                       "from its UID")
+        if not o["profileExistsOnCluster"]:
+            why.append(f"profile {k[1]} is gone, so the credentials and the repository "
+                       "password are gone")
+        if why:
+            unopenable[k] = (targets.pop(k)["orphan"], why)
+    if unopenable:
+        with Step(f"restore point details for {len(unopenable)} unopenable pairs", indent=2) as st:
+            for (ns, prof), (info, why) in sorted(unopenable.items()):
+                pvcs, stats = restore_points_from_details(kube, info["names"])
+                info.update(pvcs=pvcs, detailStats=stats, openable=False,
+                            cannotOpenBecause=why,
+                            describedFrom="restorepointcontents/<name>/details")
+            st.note = f"{sum(len(i[0].get('pvcs') or []) for i in unopenable.values())} PVCs described"
+
+    # ---- repo_checker: ENRICHMENT ONLY, after the scope is already settled ------------------
+    # It contributes the repository name and the orphan/dangling/not-synced counts, which no
+    # CR carries. Everything it returns is optional: if it aborts, the pairs above are still
+    # read and reported.
+    workdir = tempfile.mkdtemp(prefix="export-topology-")
+    # Default to the registry K10 itself pulls from: on an enterprise cluster that one is
+    # whitelisted or mirrored, gcr.io usually is not. gcr.io/kasten-images only when K10's
+    # registry cannot be read or when asked for explicitly.
+    detected = k10_image_registry(k10cfg)
+    if args.image_registry in (None, "auto"):
+        registry = detected or "gcr.io/kasten-images"
+        origin = "the registry K10 pulls from" if detected else "repo_checker default, K10's registry not readable from k10-config"
+    else:
+        registry, origin = args.image_registry, "--image-registry"
+    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
+    rc.detected_registry = detected
+    log(f"repo_checker images: {registry}/k10tools:{args.image_tag or ver}  ({origin})")
+
     inv, orphan_repos = {"repositories": []}, []
     if not args.no_inventory:
-        log("repo_checker inventory ...")
+        log("repo_checker inventory (enrichment; scope is already known) ...")
+        # the repositories of each profile, from the StorageRepository CRs, so that a profile
+        # whose inventory aborts can still be listed one repository at a time
+        repos_by_profile = {}
+        for (ns_, prof_), cr_ in hist_repos.items():
+            repos_by_profile.setdefault(prof_, []).append(cr_["repository"])
         try:
             focused = bool(args.namespace or args.policy)
             inv_profiles = sorted({prof for (_, prof) in targets} & set(profiles)) if focused else sorted(profiles)
-            inv, orphan_repos = rc.inventory(inv_profiles, full=not focused)
+            inv, orphan_repos = rc.inventory(inv_profiles, full=not focused,
+                                             repos_by_profile=repos_by_profile,
+                                             per_repository=args.inventory_per_repository)
         except ImagePullError:
             raise
         except SystemExit as e:
-            warn(f"inventory unavailable: {e}; continuing from the export policies alone")
+            warn(f"inventory unavailable: {e}; the report is built from the cluster APIs alone")
         if orphan_repos:
             enrich_orphans(kube, orphan_repos, profiles, uid)
     data_repos = [r for r in inv.get("repositories", []) if r.get("Type") == "Data"]
@@ -1307,12 +1579,27 @@ def collect(args):
                 t["policies"].add(s["PolicyName"])
             t["inv_snaps"].append(s)
 
-    if not targets:
-        warn("no export policy selects any namespace and no repository holds volume data - nothing to report")
+    if not targets and not unopenable:
+        warn("no export policy selects any namespace and nothing has ever been exported "
+             "according to the restore point history - nothing to report")
 
-    # ---- per (namespace, profile): connect and read Kopia -----------------------------------
     ns_results = {}
     not_exported = []
+    # the unopenable pairs join the results without a connect: same shape, history only
+    for (ns, prof), (info, _why) in unopenable.items():
+        ns_results[(ns, prof)] = {
+            "repository": {"name": (info.get("storageRepository") or {}).get("repository"),
+                           "nameFrom": "StorageRepository CR",
+                           "profile": prof, "inventoried": False, "openable": False,
+                           "location": {"type": (info.get("storageRepository") or {}).get("objectStoreType"),
+                                        "bucket": (info.get("storageRepository") or {}).get("bucket"),
+                                        "prefix": (info.get("storageRepository") or {}).get("path")},
+                           "note": "described from restore point details; the repository was not opened"},
+            "pvcs": info.get("pvcs") or [], "policies": {info["policy"]} if info["policy"] != "-" else set(),
+            "orphan": info, "_blobs": [], "_contents": [], "_rewrite_ts": None,
+            "_snapshot_times": [], "_snapshot_index": []}
+
+    # ---- per (namespace, profile): connect and read Kopia -----------------------------------
     try:
         _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported)
     finally:
@@ -1324,7 +1611,9 @@ def collect(args):
     log(f"  {len(export_actions)} export actions (listed after the repositories)")
 
     return _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
-                     export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir, nodes_info)
+                     export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir,
+                     nodes_info, [{'namespace': k[0], 'profile': k[1], **{x: y for x, y in v[0].items() if x != 'names'}}
+                                  for k, v in sorted(unopenable.items())])
 
 
 def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported):
@@ -1568,9 +1857,12 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
                                     "anyTaskFailed": maint_summary["anyFailure"]}
 
         repo = t["repo"] or {}
+        cr = t.get("cr") or {}
         storage = (rstatus or {}).get("storage") or {}
         ns_results[(ns, prof)] = {
-            "repository": {"name": repo.get("RepositoryName"),
+            "repository": {"name": repo.get("RepositoryName") or cr.get("repository"),
+                           "nameFrom": "repo_checker inventory" if repo.get("RepositoryName")
+                                       else ("StorageRepository CR" if cr.get("repository") else None),
                            "id": repo.get("RepositoryID"),
                            "kopiaUniqueId": (rstatus or {}).get("uniqueIDHex"),
                            "location": {"type": storage.get("type"),
@@ -1591,6 +1883,7 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
                            "contentLogicalBytes": sum(c.get("originalLength", c["length"]) for c in contents if not c.get("deleted")) if contents else None},
             "pvcs": pvcs,
             "policies": t["policies"],
+            "orphan": t.get("orphan"),
             "_blobs": blobs, "_contents": contents, "_rewrite_ts": rewrite_ts,
             "_snapshot_times": [epoch(parse_rfc3339(s["startTime"])) for s in snaps if parse_rfc3339(s["startTime"])],
             # per snapshot: when, which PVC, how big the source was - the denominator of an
@@ -1604,7 +1897,8 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
 
 
 def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
-              export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir, nodes_info=None):
+              export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir,
+              nodes_info=None, unopenable_pairs=None):
     # ---- export actions -----------------------------------------------------------------
     # One policy run (label runActionName) produces a metadata export in the K10 namespace
     # (isMetadataExport=true, no progress) and one export per application in that
@@ -1772,7 +2066,10 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
             all_ns_exports = [e for e in exports_by_policy.get(pol_name, []) if e["namespace"] == ns]
             for pv in res["pvcs"]:
                 for se in pv.get("snapshots") or []:
-                    t = epoch(parse_rfc3339(se["startTime"])) if parse_rfc3339(se["startTime"]) else None
+                    # a snapshot described from restore point details has no startTime,
+                    # only the upload end time - match on whichever it has
+                    _st = parse_rfc3339(se.get("startTime") or se.get("endTime"))
+                    t = epoch(_st) if _st else None
                     hit = None
                     for e in all_ns_exports:
                         s_, e_ = parse_rfc3339(e.get("startTime")), parse_rfc3339(e.get("endTime") or e.get("startTime"))
@@ -1780,11 +2077,16 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                             hit = e["name"]
                             break
                     se["exportAction"] = hit
-                    if hit is None:
+                    if hit is None and se.get("startTime") is None:
+                        se["exportActionNote"] = ("described from restore point details: this "
+                                                  "repository could not be opened, so there is no "
+                                                  "Kopia snapshot window to match an action against")
+                    elif hit is None:
                         se["exportActionNote"] = ("no ExportAction of this policy covers this time: written by another policy "
                                                   "or a run-now action into the same repository, or the action history was retired")
             pol_out[pol_name]["namespaces"].append({
                 "name": ns,
+                "orphan": res.get("orphan"),
                 "actionPodSpecs": aps_for_namespace(ns),
                 "repository": res["repository"],
                 "exports": ns_exports,
@@ -1819,6 +2121,10 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
         "actionPodSpecs": [{"name": n, "spec": s.get("spec")} for n, s in sorted(apspecs.items())],
         "policies": sorted(pol_out.values(), key=lambda p: p["name"]),
         "orphanedRepositories": orphan_repos,
+        # exported data that cannot be opened at all - the namespace is gone (repo_checker
+        # resolves the repository from its UID) or the profile is gone (no credentials).
+        # Described from restorepointcontents/<name>/details instead.
+        "unopenableRepositories": unopenable_pairs or [],
         "filter": ({"namespaces": args.namespace, "policies": args.policy} if (args.namespace or args.policy) else None),
         "notExported": not_exported,
         "scopeNotes": {"namespacesWithoutRestorePointSkipped": skipped_no_rp,
@@ -1855,7 +2161,11 @@ def main():
     ap.add_argument("--no-histogram", action="store_true", help="skip the file-size histogram (a full tree listing per PVC)")
     ap.add_argument("--histogram-max-files", type=int, default=2_000_000, help="skip the histogram above this many files")
     ap.add_argument("--no-content-list", action="store_true", help="skip kopia content list (no physical ingest figures)")
-    ap.add_argument("--no-inventory", action="store_true", help="skip repo_checker inventory; discover from export policies only")
+    ap.add_argument("--no-inventory", action="store_true", help="skip repo_checker inventory entirely; scope does not depend on it")
+    ap.add_argument("--inventory-per-repository", action="store_true",
+                    help="when a profile's inventory aborts, retry it one repository at a time "
+                         "(-R). Recovers the orphan/dangling counts of the repositories that are "
+                         "readable, at one full catalog re-scan each")
     ap.add_argument("--no-export-details", action="store_true", help="skip the ExportAction /details fetch (no K10 byte counters)")
     ap.add_argument("--export-details-max", type=int, default=20, help="newest exports per namespace/policy to fetch details for (0 = all)")
     ap.add_argument("-v", "--verbose", action="store_true", help="echo every repo_checker / k10tools progress line")
