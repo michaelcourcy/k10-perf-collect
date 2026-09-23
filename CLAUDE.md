@@ -149,6 +149,13 @@ They must not drift. The guides take their figures from `lib/` helpers that read
 the same pair (file counts, histogram buckets, per-snapshot physical ingest including
 the nearest-window attribution and 1 s padding, change rate).
 
+**One deliberate exception: orphan discovery is the generator's alone.** The guides do
+not find namespaces or policies that have been deleted, and should not be taught to.
+Finding them means listing `restorepointcontents` and `storagerepositories` for the whole
+cluster, which contradicts the one-pair focus the guides are built on, for data that is a
+cost and hygiene finding rather than a performance one. Decided 2026-09-23; do not
+"align" the guides on it.
+
 When either side learns something about a data source, change both. In particular:
 
 | Quantity | Correct field | The field that looks right and is not |
