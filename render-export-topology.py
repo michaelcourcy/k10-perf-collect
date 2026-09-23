@@ -316,6 +316,50 @@ def in_progress_block(ip):
             f'can resume; they are not restore points and are excluded from the counts.</div>')
 
 
+def orphan_banner(o):
+    """A namespace whose policy or namespace has been deleted: the data is still on the
+    object store but nothing will ever be added to it. Say so before any figure is read."""
+    if not o:
+        return ""
+    gone = " and ".join(o.get("orphanedBy") or [])
+    why = o.get("cannotOpenBecause") or []
+    extra = ""
+    if o.get("openable") is False:
+        extra = ('<br><span class="muted">The repository was not opened — '
+                 + esc("; ".join(why)) + '. Everything below is reconstructed from '
+                 '<code>restorepointcontents/&lt;name&gt;/details</code>: the PVC, its storage class, '
+                 'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio, '
+                 'maintenance state and the file-size histogram need the repository and are not '
+                 'available.</span>')
+    st = o.get("detailStats") or {}
+    read = (f' <span class="muted">({st.get("restorePointsRead")} of {st.get("restorePointsAvailable")} '
+            f'restore points read)</span>' if st else "")
+    return (f'<div class="note" style="border-left:3px solid var(--warning);padding-left:8px">'
+            f'<b>Frozen — no longer exported.</b> The {esc(gone)} no longer exists, so this namespace '
+            f'stopped at its last restore point on {esc(fmt_ts(o.get("frozenSince")))} '
+            f'({fmt_num(o.get("restorePoints"))} restore points, policy <code>{esc(o.get("policy"))}</code>){read}. '
+            f'The figures below are history, not a current state, and the data still occupies the '
+            f'object store.{extra}</div>')
+
+
+def details_snapshots_table(snaps):
+    """Restore points of a repository that could not be opened. Different columns from the
+    Kopia-derived table: there is an upload END time but no start, no duration, no hashed
+    count and no physical ingest attribution - only what K10 recorded per artifact."""
+    rows = []
+    for s in snaps:
+        rows.append([
+            esc(fmt_ts(s.get("endTime"))),
+            f'<code class="muted">{esc((s.get("kopiaSnapshotId") or "–")[:16])}</code>',
+            fmt_num(s.get("fileCount")),
+            fmt_bytes(s.get("totalSizeBytes")),
+            fmt_bytes(s.get("physicalBytes")),
+            f'<span class="muted">{esc(s.get("restorePointContent") or "")}</span>',
+        ])
+    return table(["Upload ended", "Kopia snapshot", "Files", "Logical size", "Physical", "Restore point"],
+                 rows, num_cols=(2, 3, 4))
+
+
 def pvc_row(p):
     cr = p.get("lastChangeRate") or {}
     if cr.get("logicalDeltaBytes") is not None:
@@ -349,6 +393,16 @@ def pvc_row(p):
         notes.append("PVC no longer exists on the cluster (resolved from the repository)")
     if p.get("resolvedBy") == "structural":
         notes.append("PVC name parsed structurally from the Kopia host, not matched to a live PVC")
+    if p.get("source") == "restorepointcontent details":
+        detail = (
+            f'<div class="detail">'
+            f'<figcaption>Restore points ({fmt_num(p.get("snapshotCount"))})</figcaption>'
+            f'{details_snapshots_table(p.get("snapshots") or [])}'
+            + "".join(f'<div class="note">{esc(n)}</div>' for n in notes)
+            + '<div class="note">Described from the restore point details: the repository could not '
+              'be opened, so there is no file-size histogram, no hashed/unchanged count and no '
+              'per-snapshot physical ingest attribution.</div></div>')
+        return f"<details>{summary}{detail}</details>"
     detail = (
         f'<div class="detail"><div class="two">'
         f'<div>{histogram_figure(p.get("sizeHistogram"), p["name"])}</div>'
@@ -402,13 +456,25 @@ def exports_table(exports):
 def namespace_block(ns):
     repo = ns.get("repository") or {}
     m = repo.get("maintenance") or {}
-    chips = [
-        chip("repository", repo.get("name")),
-        chip("objects on store", fmt_num(repo.get("objectCount"))),
-        chip("stored", fmt_bytes(repo.get("objectBytes"))),
-        chip("content physical", fmt_bytes(repo.get("contentPhysicalBytes"))),
-        chip("content logical", fmt_bytes(repo.get("contentLogicalBytes"))),
-    ]
+    orphan = ns.get("orphan")
+    if repo.get("openable") is False:
+        # nothing was read from the repository: show only what the CRs and the restore point
+        # details know, rather than a row of "–" that looks like missing data
+        chips = [chip("repository", repo.get("name"))]
+        loc = repo.get("location") or {}
+        if loc.get("bucket"):
+            chips.append(chip("bucket", loc["bucket"]))
+        if loc.get("prefix"):
+            chips.append(chip("path", loc["prefix"]))
+        chips.append(chip("restore points", fmt_num((orphan or {}).get("restorePoints"))))
+    else:
+        chips = [
+            chip("repository", repo.get("name")),
+            chip("objects on store", fmt_num(repo.get("objectCount"))),
+            chip("stored", fmt_bytes(repo.get("objectBytes"))),
+            chip("content physical", fmt_bytes(repo.get("contentPhysicalBytes"))),
+            chip("content logical", fmt_bytes(repo.get("contentLogicalBytes"))),
+        ]
     if repo.get("contentPhysicalBytes") and repo.get("contentLogicalBytes"):
         chips.append(chip("dedup+compression", f'{repo["contentPhysicalBytes"]/repo["contentLogicalBytes"]:.2f}×'))
     if repo.get("orphanedCount"):
@@ -426,12 +492,16 @@ def namespace_block(ns):
         f'<div class="card"><h3>Namespace <code>{esc(ns["name"])}</code> '
         f'<span class="sub">— {fmt_num(ns.get("pvcCount"))} PVCs · {fmt_num(ns.get("totalFileCount"))} files · {esc(fmt_bytes(ns.get("totalSizeBytes")))}</span></h3>'
         f'<div class="chips">{"".join(chips)}</div>'
-        f'<div style="margin:6px 0 2px">Maintenance: {maintenance_status(m)}'
-        f'<span class="muted"> · quick every {ns_dur((m.get("quick") or {}).get("interval"))}, full every {ns_dur((m.get("full") or {}).get("interval"))}, next full {esc(fmt_ts(m.get("nextFullMaintenance")))}</span></div>'
-        f'{restamp_note}{aps_html}'
-        f'<h3 style="margin-top:14px">Exports</h3>{exports_table(ns.get("exports"))}'
-        f'<h3 style="margin-top:14px">PVCs</h3>{hdr}{"".join(pvc_row(p) for p in ns.get("pvcs") or [])}'
-        f'</div>'
+        f'{orphan_banner(orphan)}'
+        + ("" if repo.get("openable") is False else
+           f'<div style="margin:6px 0 2px">Maintenance: {maintenance_status(m)}'
+           f'<span class="muted"> · quick every {ns_dur((m.get("quick") or {}).get("interval"))}, full every {ns_dur((m.get("full") or {}).get("interval"))}, next full {esc(fmt_ts(m.get("nextFullMaintenance")))}</span></div>')
+        + f'{restamp_note}{aps_html}'
+        + ("" if repo.get("openable") is False else
+           f'<h3 style="margin-top:14px">Exports</h3>{exports_table(ns.get("exports"))}')
+        + f'<h3 style="margin-top:14px">PVCs</h3>{hdr}'
+        + "".join(pvc_row(p) for p in ns.get("pvcs") or [])
+        + '</div>'
     )
 
 
@@ -451,9 +521,11 @@ def policy_card(p):
         flags.append(status("bad", f"validation {p['validation']}"))
     if not p.get("existsOnCluster"):
         flags.append(status("warn", "policy no longer on cluster"))
-    chips = [chip("profile", prof.get("name")), chip("snapshot", p.get("frequency")),
+    # a deleted policy has no spec left: say "unknown", not an empty chip
+    unk = "unknown" if not p.get("existsOnCluster") else "–"
+    chips = [chip("profile", prof.get("name") or unk), chip("snapshot", p.get("frequency") or unk),
              chip("selects", "VMs (KubeVirt)" if p.get("selectorKind") == "vm" else "namespaces"),
-             chip("export", p.get("exportFrequency") or "–"), chip("retention", ret_txt)]
+             chip("export", p.get("exportFrequency") or unk), chip("retention", ret_txt if ret else unk)]
     if p.get("subFrequency"):
         chips.append(chip("subFrequency", json.dumps(p["subFrequency"])))
     nns = len(p.get("namespaces") or [])
@@ -549,6 +621,9 @@ def focus(t, policies=None, namespaces=None):
                           and (not policies or set(x.get("policies") or []) & set(policies))]
     out["orphanedRepositories"] = [o for o in t.get("orphanedRepositories") or []
                                    if not namespaces or o.get("namespace") in namespaces]
+    out["unopenableRepositories"] = [x for x in t.get("unopenableRepositories") or []
+                                     if (not namespaces or x.get("namespace") in namespaces)
+                                     and (not policies or x.get("policy") in policies)]
     parts = []
     if policies:
         parts.append("polic" + ("y " if len(policies) == 1 else "ies ") + ", ".join(policies))
@@ -611,6 +686,24 @@ def render(t, banner=None):
                                 f'<span class="muted">{esc(o.get("path") or "–")}</span>',
                                 f'<span title="{esc(" -> ".join(o.get("k10toolsError") or []))}">{esc(o.get("reason") or o.get("note") or "")}</span>']
                                for o in orphans])
+                      + '</details>')
+    uo = t.get("unopenableRepositories") or []
+    if uo:
+        warn_html += ('<details class="card warn-box" open><summary><b>Exported data that can no longer be opened</b> '
+                      f'<span class="sub">{len(uo)} — described from the restore point details; '
+                      'the data is still on the object store</span></summary>'
+                      '<div class="note">A repository is opened with '
+                      '<code>repo_checker -o connect -a &lt;namespace&gt; -p &lt;profile&gt;</code>, which resolves it '
+                      'from the <b>live namespace UID</b> and needs the profile for the credentials. Delete either and '
+                      'the repository becomes unreadable while its contents stay on the object store. '
+                      '<code>restorepointcontents/&lt;name&gt;/details</code> is cluster-scoped and survives both, so the '
+                      'PVCs, Kopia snapshot ids and sizes below come from there.</div>'
+                      + table(["Namespace", "Policy", "Profile", "Gone", "Restore points", "Frozen since", "Why it cannot be opened"],
+                              [[esc(x.get("namespace")), f'<code>{esc(x.get("policy"))}</code>', esc(x.get("profile")),
+                                esc(" + ".join(x.get("orphanedBy") or [])),
+                                fmt_num(x.get("restorePoints")), esc(fmt_ts(x.get("frozenSince"))),
+                                f'<span class="muted">{esc("; ".join(x.get("cannotOpenBecause") or []))}</span>']
+                               for x in uo], num_cols=(4,))
                       + '</details>')
     ne = t.get("notExported") or []
     if ne:
