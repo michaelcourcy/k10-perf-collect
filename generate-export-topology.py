@@ -522,6 +522,108 @@ def datamover_metrics(prom, k10ns, pod_regex, start, end, namespace=None):
     return out
 
 
+def datamover_runs_for_namespace(prom, k10ns, pod_regex, namespace, start, end):
+    """Datamover CPU and memory for a namespace that no longer exists.
+
+    Deleting an application namespace does not touch these metrics: the datamover pods run
+    in the K10 namespace, and kube-state-metrics keeps publishing their labels for as long
+    as Prometheus retains them. Measured on the reference cluster, 23 pods still carried
+    label_app_name=large-test a day after that namespace was deleted.
+
+    What IS lost is the window. Normally it comes from the ExportAction's start and end, and
+    those are namespaced objects that go with the namespace. So the window is rebuilt from
+    the pods themselves, in two passes - a long range at a fine step is rejected by Thanos
+    (HTTP 400: too many points):
+
+      1. kube_pod_labels over the whole retention window at a COARSE step, to learn which
+         pods worked for this namespace and roughly when. Labels are published for a pod's
+         whole life, so a coarse step still finds them.
+      2. cAdvisor at the normal 15 s step, per reconstructed run, for the actual peaks.
+
+    Pods whose spans are within GAP of each other belong to the same run."""
+    if not (prom and prom.available):
+        return None
+    sel = 'namespace="%s",pod=~"%s",container!="",container!="POD"' % (k10ns, pod_regex)
+    COARSE, GAP = "5m", 600
+    try:
+        labels = prom.query_range('kube_pod_labels{namespace="%s",label_app_name="%s"}' % (k10ns, namespace),
+                                  start, end, step=COARSE)
+    except Exception as ex:  # noqa: BLE001
+        return {"error": str(ex)}
+    if not labels:
+        return {"runs": [], "note": "no kube_pod_labels series carries this namespace inside the "
+                                    "metrics retention window"}
+
+    spans, jobs = {}, {}
+    for r in labels:
+        pod = r["metric"]["pod"]
+        ts = [float(t) for t, _ in r["values"]]
+        if not ts:
+            continue
+        spans[pod] = (min(ts), max(ts))
+        jid = r["metric"].get("label_k10_kasten_io_job_id")
+        if jid:
+            jobs.setdefault(jid, set()).add(pod)
+    # copy-vol-data pods carry only the job id: pull in the siblings of each known job
+    if jobs:
+        try:
+            sib = prom.query_range('kube_pod_labels{namespace="%s",pod=~"%s"}' % (k10ns, pod_regex),
+                                   start, end, step=COARSE)
+        except Exception:  # noqa: BLE001
+            sib = []
+        for r in sib:
+            jid, pod = r["metric"].get("label_k10_kasten_io_job_id"), r["metric"]["pod"]
+            if jid in jobs and pod not in spans:
+                ts = [float(t) for t, _ in r["values"]]
+                if ts:
+                    spans[pod] = (min(ts), max(ts))
+
+    runs = []
+    for pod, (lo, hi) in sorted(spans.items(), key=lambda kv: kv[1][0]):
+        if runs and lo <= runs[-1]["hi"] + GAP:
+            runs[-1]["pods"].append(pod)
+            runs[-1]["hi"] = max(runs[-1]["hi"], hi)
+        else:
+            runs.append({"lo": lo, "hi": hi, "pods": [pod]})
+
+    out = []
+    for r in runs:
+        lo, hi = r["lo"] - METRICS_PAD_SECONDS, r["hi"] + METRICS_PAD_SECONDS
+        # plain alternation: pod names are [a-z0-9-] and PromQL uses RE2, which rejects the
+        # \- that re.escape emits ("parse error: unknown escape sequence")
+        podsel = "|".join(r["pods"])
+        try:
+            mem = prom.query_range('sum(container_memory_working_set_bytes{%s,pod=~"%s"})'
+                                   % (sel, podsel), lo, hi)
+            cpu = prom.query_range('sum by (pod) (container_cpu_usage_seconds_total{%s,pod=~"%s"})'
+                                   % (sel, podsel), lo, hi)
+        except Exception as ex:  # noqa: BLE001
+            out.append({"windowStart": iso(dt.datetime.fromtimestamp(lo, dt.timezone.utc)),
+                        "pods": sorted(r["pods"]), "error": str(ex)})
+            continue
+        vals = [float(v) for s_ in mem for _, v in s_["values"]]
+        total_cpu = 0.0
+        for c in cpu:
+            cv = [float(v) for _, v in c["values"]]
+            # max - min, not last - first: container_cpu_usage_seconds_total is cumulative
+            # but resets when a container restarts, and last - first then goes negative
+            if len(cv) >= 2:
+                total_cpu += max(cv) - min(cv)
+        dur = max(r["hi"] - r["lo"], 1)
+        out.append({
+            "windowStart": iso(dt.datetime.fromtimestamp(r["lo"], dt.timezone.utc)),
+            "windowEnd": iso(dt.datetime.fromtimestamp(r["hi"], dt.timezone.utc)),
+            "durationSeconds": round(dur, 1), "pods": sorted(r["pods"]),
+            "peakSumMemoryBytes": int(max(vals)) if vals else None,
+            "samples": len(vals), "cpuSecondsTotal": round(total_cpu, 3),
+            "avgCpuCores": round(total_cpu / dur, 4)})
+    out.sort(key=lambda x: x["windowStart"], reverse=True)
+    return {"runs": out,
+            "note": "windows reconstructed from the datamover pods themselves (kube_pod_labels "
+                    "label_app_name), because the ExportActions went with the namespace. Bounded "
+                    "by the Prometheus retention window, not by the export history."}
+
+
 def k10tools_cause_chain(text):
     """k10tools prints `Error: {"message":...,"cause":{...}}`; causes nest, and any level may be
     a JSON document encoded as a string or a message that is itself JSON. Return the flat
@@ -1536,6 +1638,13 @@ def collect(args):
                 info.update(pvcs=pvcs, detailStats=stats, openable=False,
                             cannotOpenBecause=why,
                             describedFrom="restorepointcontents/<name>/details")
+                # the namespace is gone but its datamover pods ran in the K10 namespace,
+                # so cAdvisor and kube-state-metrics still have them
+                if prom and prom.available and prom.retention_seconds:
+                    now = time.time()
+                    info["datamover"] = datamover_runs_for_namespace(
+                        prom, kube.k10ns, args.datamover_pod_regex, ns,
+                        now - prom.retention_seconds, now)
             st.note = f"{sum(len(i[0].get('pvcs') or []) for i in unopenable.values())} PVCs described"
 
     # ---- repo_checker: ENRICHMENT ONLY, after the scope is already settled ------------------

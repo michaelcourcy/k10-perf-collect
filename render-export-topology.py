@@ -351,6 +351,32 @@ def orphan_banner(o):
             f'object store.{extra}</div>')
 
 
+def reconstructed_runs_block(dm):
+    """Datamover usage for a deleted namespace. The pods ran in the K10 namespace, so
+    cAdvisor and kube-state-metrics still have them; only the ExportAction windows were
+    lost, and those are rebuilt from the pods' own scrape spans."""
+    if not dm:
+        return ""
+    if dm.get("error"):
+        return f'<div class="note">Datamover metrics unavailable: {esc(dm["error"])}</div>'
+    runs = dm.get("runs") or []
+    if not runs:
+        return f'<div class="note">{esc(dm.get("note") or "no datamover metrics for this namespace")}</div>'
+    top = sorted(runs, key=lambda r: -(r.get("peakSumMemoryBytes") or 0))[:12]
+    rows = [[esc(fmt_ts(r.get("windowStart"))), esc(fmt_dur(r.get("durationSeconds"))),
+             fmt_num(len(r.get("pods") or [])), fmt_bytes(r.get("peakSumMemoryBytes")),
+             f'{r.get("cpuSecondsTotal")} <span class="muted">cpu-s</span>',
+             f'{r.get("avgCpuCores")} <span class="muted">cores avg</span>']
+            for r in top]
+    return ('<figcaption style="margin-top:12px">Datamover runs reconstructed from the pods '
+            f'({len(runs)} found, {len(top)} heaviest shown)</figcaption>'
+            + table(["Window start", "Duration", "Pods", "Peak memory", "CPU", "Average"],
+                    rows, num_cols=(2, 3, 4, 5))
+            + f'<div class="note">{esc(dm.get("note") or "")} Each figure is a floor: a pod alive '
+              'for less than one scrape interval leaves no sample, and the window is the span over '
+              'which the pods were scraped, not the ExportAction\'s own start and end.</div>')
+
+
 def details_snapshots_table(snaps):
     """Restore points of a repository that could not be opened. Different columns from the
     Kopia-derived table: there is an upload END time but no start, no duration, no hashed
@@ -510,6 +536,7 @@ def namespace_block(ns):
            f'<h3 style="margin-top:14px">Exports</h3>{exports_table(ns.get("exports"))}')
         + f'<h3 style="margin-top:14px">PVCs</h3>{hdr}'
         + "".join(pvc_row(p) for p in ns.get("pvcs") or [])
+        + reconstructed_runs_block((orphan or {}).get("datamover"))
         + '</div>'
     )
 
