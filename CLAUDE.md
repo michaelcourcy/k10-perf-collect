@@ -220,11 +220,22 @@ from the history**, all still readable because the profile survived.
 
 Three tiers of orphan, by what is still possible:
 
-| Gone | Detected from | Openable | Reported as |
+| Gone | Detected from | repo_checker can open it | Reported as |
 |---|---|---|---|
-| policy | RPC labels | yes | a normal namespace entry with `orphan.orphanedBy` |
-| namespace | RPC labels | yes | same |
-| **profile** | RPC + SR | **no** - it holds the credentials and the repository password | `repositoriesWithoutAProfile`, location and restore-point count only |
+| policy only | RPC labels | yes | a normal namespace entry with `orphan.orphanedBy` |
+| namespace | RPC labels | **no** - see below | `unopenableRepositories`, described from `/details` |
+| profile | RPC + SR | **no**, and genuinely unreadable | same |
+
+The namespace case is a **tool limit, not a data limit**, and the report must say so.
+`repo_checker -o connect` only accepts `-a <namespace> -p <profile>` and resolves the
+repository by looking that namespace up. The path is not lost: `StorageRepository`
+`status.location.objectStore.path` records it, and its last segment **is** the namespace
+UID (verified against live namespaces: `cnpg-test` UID `97e94d2a-…` appears as
+`…/migration/repo/97e94d2a-…/`). K10 itself keeps opening the repository - on the
+reference cluster the CR's `status.processResults` showed a successful `MaintenanceRun`
+the day *after* the namespace was deleted, 372 operations in total. Only a deleted
+**profile** makes a repository genuinely unreadable, because the credentials and the
+repository password go with it.
 
 The inventory escalation when a profile-wide run fails is `-R <repository>` per repository
 from the `StorageRepository` list, skipping the one that aborted. Orphans are reported

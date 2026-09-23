@@ -325,12 +325,21 @@ def orphan_banner(o):
     why = o.get("cannotOpenBecause") or []
     extra = ""
     if o.get("openable") is False:
-        extra = ('<br><span class="muted">The repository was not opened — '
+        cr = o.get("storageRepository") or {}
+        alive = ""
+        if cr.get("lastProcessedAt"):
+            alive = ('<br><span class="muted"><b>The repository itself is fine.</b> K10 last ran '
+                     f'<code>{esc(cr.get("lastProcedure"))}</code> on it at '
+                     f'{esc(fmt_ts(cr.get("lastProcessedAt")))}'
+                     + (" successfully" if cr.get("lastProcedureSucceeded") else "")
+                     + f' ({fmt_num(cr.get("processCount"))} operations in total), so it is still being '
+                     'opened and maintained — including after the namespace was deleted. What is '
+                     'missing is a way to point repo_checker at it.</span>')
+        extra = ('<br><span class="muted">Not read here — '
                  + esc("; ".join(why)) + '. Everything below is reconstructed from '
                  '<code>restorepointcontents/&lt;name&gt;/details</code>: the PVC, its storage class, '
-                 'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio, '
-                 'maintenance state and the file-size histogram need the repository and are not '
-                 'available.</span>')
+                 'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio and '
+                 'the file-size histogram would need the repository to be opened.</span>' + alive)
     st = o.get("detailStats") or {}
     read = (f' <span class="muted">({st.get("restorePointsRead")} of {st.get("restorePointsAvailable")} '
             f'restore points read)</span>' if st else "")
@@ -692,17 +701,23 @@ def render(t, banner=None):
         warn_html += ('<details class="card warn-box" open><summary><b>Exported data that can no longer be opened</b> '
                       f'<span class="sub">{len(uo)} — described from the restore point details; '
                       'the data is still on the object store</span></summary>'
-                      '<div class="note">A repository is opened with '
-                      '<code>repo_checker -o connect -a &lt;namespace&gt; -p &lt;profile&gt;</code>, which resolves it '
-                      'from the <b>live namespace UID</b> and needs the profile for the credentials. Delete either and '
-                      'the repository becomes unreadable while its contents stay on the object store. '
+                      '<div class="note"><code>repo_checker -o connect</code> only accepts '
+                      '<code>-a &lt;namespace&gt; -p &lt;profile&gt;</code> and resolves the repository by looking that '
+                      'namespace up, so once the namespace is deleted it cannot be pointed at the repository. '
+                      'That is a limit of the tool, not of the data: the StorageRepository CR still records the '
+                      'resolved path, whose last segment is the deleted namespace\'s UID, and K10 goes on opening '
+                      'and maintaining the repository (see the maintenance dates below). A deleted <b>profile</b> is '
+                      'the harder case — the credentials and the repository password go with it. '
                       '<code>restorepointcontents/&lt;name&gt;/details</code> is cluster-scoped and survives both, so the '
                       'PVCs, Kopia snapshot ids and sizes below come from there.</div>'
-                      + table(["Namespace", "Policy", "Profile", "Gone", "Restore points", "Frozen since", "Why it cannot be opened"],
+                      + table(["Namespace", "Policy", "Profile", "Gone", "Restore points", "Frozen since",
+                               "K10 last worked on it"],
                               [[esc(x.get("namespace")), f'<code>{esc(x.get("policy"))}</code>', esc(x.get("profile")),
                                 esc(" + ".join(x.get("orphanedBy") or [])),
                                 fmt_num(x.get("restorePoints")), esc(fmt_ts(x.get("frozenSince"))),
-                                f'<span class="muted">{esc("; ".join(x.get("cannotOpenBecause") or []))}</span>']
+                                (lambda c: (f'{esc(fmt_ts(c.get("lastProcessedAt")))} '
+                                            f'<span class="muted">{esc(c.get("lastProcedure") or "")}</span>')
+                                 if c.get("lastProcessedAt") else '<span class="muted">–</span>')(x.get("storageRepository") or {})]
                                for x in uo], num_cols=(4,))
                       + '</details>')
     ne = t.get("notExported") or []

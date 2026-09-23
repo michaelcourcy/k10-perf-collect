@@ -648,10 +648,18 @@ def exported_history(kube):
         if not ns or not prof:
             continue
         store = ((st.get("location") or {}).get("objectStore") or {})
+        # K10's own record of what it last did to this repository. It keeps maintaining an
+        # orphaned repository long after the namespace is gone - proof that the data is
+        # reachable and that only repo_checker's CLI cannot be pointed at it.
+        recent = ((st.get("processResults") or {}).get("recentResults") or [])
+        last = recent[0] if recent else {}
         repos[(ns, prof)] = {"repository": c["metadata"]["name"], "contentType": st.get("contentType"),
                              "bucket": store.get("name"), "path": store.get("path"),
                              "objectStoreType": store.get("objectStoreType"), "region": store.get("region"),
-                             "fileStore": (st.get("location") or {}).get("fileStore")}
+                             "fileStore": (st.get("location") or {}).get("fileStore"),
+                             "processCount": (st.get("processResults") or {}).get("processCount"),
+                             "lastProcedure": last.get("procedure"), "lastProcessedAt": last.get("endTime"),
+                             "lastProcedureSucceeded": last.get("succeeded")}
     return triples, repos
 
 
@@ -1509,11 +1517,16 @@ def collect(args):
             continue
         why = []
         if "namespace" in o["orphanedBy"]:
-            why.append("the namespace is gone, so repo_checker cannot resolve the repository "
-                       "from its UID")
+            # not a property of the data: the StorageRepository CR already records the
+            # resolved path, and that path IS the namespace UID (verified against live
+            # namespaces). repo_checker simply insists on deriving it from a live namespace.
+            why.append("repo_checker -o connect only accepts -a <namespace> and resolves the "
+                       "repository by looking that namespace up, so it cannot be pointed at "
+                       "this one. The path is not lost: the StorageRepository CR records it, "
+                       "and its last segment is the deleted namespace's UID")
         if not o["profileExistsOnCluster"]:
             why.append(f"profile {k[1]} is gone, so the credentials and the repository "
-                       "password are gone")
+                       "password are gone - this one really is unreadable")
         if why:
             unopenable[k] = (targets.pop(k)["orphan"], why)
     if unopenable:
