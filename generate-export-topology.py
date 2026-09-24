@@ -49,7 +49,9 @@ import urllib.request
 REPO_CHECKER_URL = "https://docs.kasten.io/downloads/{version}/tools/k10_repo_checker.sh"
 
 # Worker pods K10 creates for an export. Validated on 9.0.5 (guide 09).
-DATAMOVER_POD_REGEX = r"data-mover.*|copy-vol-data.*|create-repo.*|repository-server.*|restore-data.*"
+# block-mode-upload-* is how a block-mode export moves its data; without it a block-mode
+# namespace looks as though it used no datamover at all
+DATAMOVER_POD_REGEX = r"data-mover.*|copy-vol-data.*|create-repo.*|repository-server.*|restore-data.*|block-mode-upload.*"
 
 # k10-config keys that govern datamover behaviour (guide 10 step 3).
 LIMITER_KEY_REGEX = re.compile(
@@ -545,9 +547,18 @@ def datamover_runs_for_namespace(prom, k10ns, pod_regex, namespace, start, end):
         return None
     sel = 'namespace="%s",pod=~"%s",container!="",container!="POD"' % (k10ns, pod_regex)
     COARSE, GAP = "5m", 600
+    # Two different namespace labels, and a block-mode export only has the second:
+    #   label_app_name                        data-mover-svc-*  (filesystem mode)
+    #   label_k10_kasten_io_migration_app_ns  block-mode-upload-*
+    # Measured: 25 block-mode-upload pods for large-test-block carried migration_app_ns and
+    # no app-name at all, so querying app_name alone found nothing and the namespace looked
+    # as though it had no datamover metrics.
     try:
-        labels = prom.query_range('kube_pod_labels{namespace="%s",label_app_name="%s"}' % (k10ns, namespace),
-                                  start, end, step=COARSE)
+        labels = []
+        for matcher in ('label_app_name="%s"' % namespace,
+                        'label_k10_kasten_io_migration_app_ns="%s"' % namespace):
+            labels += prom.query_range('kube_pod_labels{namespace="%s",%s}' % (k10ns, matcher),
+                                       start, end, step=COARSE)
     except Exception as ex:  # noqa: BLE001
         return {"error": str(ex)}
     if not labels:
@@ -592,16 +603,22 @@ def datamover_runs_for_namespace(prom, k10ns, pod_regex, namespace, start, end):
         # plain alternation: pod names are [a-z0-9-] and PromQL uses RE2, which rejects the
         # \- that re.escape emits ("parse error: unknown escape sequence")
         podsel = "|".join(r["pods"])
+        # exact pod names only: these came from kube_pod_labels filtered by the namespace,
+        # so ANDing the datamover name regex on top would silently drop any pod family the
+        # regex does not know about
+        psel = 'namespace="%s",pod=~"%s",container!="",container!="POD"' % (k10ns, podsel)
         try:
-            mem = prom.query_range('sum(container_memory_working_set_bytes{%s,pod=~"%s"})'
-                                   % (sel, podsel), lo, hi)
-            cpu = prom.query_range('sum by (pod) (container_cpu_usage_seconds_total{%s,pod=~"%s"})'
-                                   % (sel, podsel), lo, hi)
+            mem = prom.query_range('sum(container_memory_working_set_bytes{%s})' % psel, lo, hi)
+            cpu = prom.query_range('sum by (pod) (container_cpu_usage_seconds_total{%s})' % psel, lo, hi)
         except Exception as ex:  # noqa: BLE001
             out.append({"windowStart": iso(dt.datetime.fromtimestamp(lo, dt.timezone.utc)),
                         "pods": sorted(r["pods"]), "error": str(ex)})
             continue
-        vals = [float(v) for s_ in mem for _, v in s_["values"]]
+        vals, times = [], []
+        for s_ in mem:
+            for t, v in s_["values"]:
+                times.append(float(t))
+                vals.append(float(v))
         total_cpu = 0.0
         for c in cpu:
             cv = [float(v) for _, v in c["values"]]
@@ -609,15 +626,26 @@ def datamover_runs_for_namespace(prom, k10ns, pod_regex, namespace, start, end):
             # but resets when a container restarts, and last - first then goes negative
             if len(cv) >= 2:
                 total_cpu += max(cv) - min(cv)
-        dur = max(r["hi"] - r["lo"], 1)
-        out.append({
-            "windowStart": iso(dt.datetime.fromtimestamp(r["lo"], dt.timezone.utc)),
-            "windowEnd": iso(dt.datetime.fromtimestamp(r["hi"], dt.timezone.utc)),
+        # The span must come from the 15 s cAdvisor samples, not from the 5 min label
+        # scan: a pod seen in a single coarse bucket gives lo == hi, and dividing the CPU
+        # seconds by a 1 s "duration" produced 18 cores average for a 1 s window.
+        obs_lo, obs_hi = (min(times), max(times)) if times else (r["lo"], r["hi"])
+        dur = obs_hi - obs_lo
+        entry = {
+            "windowStart": iso(dt.datetime.fromtimestamp(obs_lo, dt.timezone.utc)),
+            "windowEnd": iso(dt.datetime.fromtimestamp(obs_hi, dt.timezone.utc)),
             "durationSeconds": round(dur, 1), "pods": sorted(r["pods"]),
             "peakSumMemoryBytes": int(max(vals)) if vals else None,
-            "samples": len(vals), "cpuSecondsTotal": round(total_cpu, 3),
-            "avgCpuCores": round(total_cpu / dur, 4)})
-    out.sort(key=lambda x: x["windowStart"], reverse=True)
+            "samples": len(vals), "cpuSecondsTotal": round(total_cpu, 3)}
+        # one sample is a point, not an interval: an average over it is meaningless
+        if dur >= 15 and len(vals) >= 2:
+            entry["avgCpuCores"] = round(total_cpu / dur, 4)
+        else:
+            entry["avgCpuCores"] = None
+            entry["note"] = ("too few samples to average: the pods were scraped %d time(s), so "
+                             "only the CPU-second total is meaningful" % len(vals))
+        out.append(entry)
+    out.sort(key=lambda x: x["windowStart"], reverse=True)  # newest first
     return {"runs": out,
             "note": "windows reconstructed from the datamover pods themselves (kube_pod_labels "
                     "label_app_name), because the ExportActions went with the namespace. Bounded "

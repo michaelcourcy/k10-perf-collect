@@ -362,14 +362,18 @@ def reconstructed_runs_block(dm):
     runs = dm.get("runs") or []
     if not runs:
         return f'<div class="note">{esc(dm.get("note") or "no datamover metrics for this namespace")}</div>'
-    top = sorted(runs, key=lambda r: -(r.get("peakSumMemoryBytes") or 0))[:12]
+    # chronological, newest first - the same order as every other table in the report
+    top = sorted(runs, key=lambda r: r.get("windowStart") or "", reverse=True)[:12]
     rows = [[esc(fmt_ts(r.get("windowStart"))), esc(fmt_dur(r.get("durationSeconds"))),
              fmt_num(len(r.get("pods") or [])), fmt_bytes(r.get("peakSumMemoryBytes")),
              f'{r.get("cpuSecondsTotal")} <span class="muted">cpu-s</span>',
-             f'{r.get("avgCpuCores")} <span class="muted">cores avg</span>']
+             (f'{r["avgCpuCores"]} <span class="muted">cores avg</span>'
+              if r.get("avgCpuCores") is not None
+              else f'<span class="muted" title="{esc(r.get("note") or "")}">n/a</span>')]
             for r in top]
+    more = f", {len(top)} most recent shown" if len(runs) > len(top) else ""
     return ('<figcaption style="margin-top:12px">Datamover runs reconstructed from the pods '
-            f'({len(runs)} found, {len(top)} heaviest shown)</figcaption>'
+            f'({len(runs)} found{more})</figcaption>'
             + table(["Window start", "Duration", "Pods", "Peak memory", "CPU", "Average"],
                     rows, num_cols=(2, 3, 4, 5))
             + f'<div class="note">{esc(dm.get("note") or "")} Each figure is a floor: a pod alive '
