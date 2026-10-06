@@ -663,6 +663,49 @@ def datamover_runs_for_namespace(prom, k10ns, pod_regex, namespace, start, end):
                     "by the Prometheus retention window, not by the export history."}
 
 
+CONNECT_DIAGNOSES = [
+    (("x509", "certificate signed by unknown authority", "failed to verify certificate",
+      "certificate is valid for", "tls: "),
+     "the object store's TLS certificate is not trusted inside the pod",
+     "repo_checker runs kopia in a k10tools/debug-kopia pod that it builds itself, and it does "
+     "not give that pod the profile's CA or the cluster trust bundle. K10's own pods do get "
+     "them, which is why exports keep succeeding while this fails. Either add the CA to the "
+     "pod's trust store, or set skipSSLVerify on the Location Profile - but note that only "
+     "fixes it if repo_checker honours the flag, which is worth checking rather than assuming."),
+    (("no such host", "server misbehaving", "dns"),
+     "the object store endpoint does not resolve from inside the pod",
+     "the endpoint in the Location Profile may be resolvable from K10's pods but not from this "
+     "one, or it may rely on a search domain the pod does not get."),
+    (("connection refused", "i/o timeout", "deadline exceeded", "no route to host"),
+     "the object store endpoint is not reachable from inside the pod",
+     "check egress policy and any proxy: the pod repo_checker creates may not inherit the "
+     "NO_PROXY/HTTPS_PROXY environment K10's own deployments have."),
+    (("access denied", "403", "invalidaccesskeyid", "signaturedoesnotmatch"),
+     "the object store rejected the credentials",
+     "the profile's credential secret is readable but the store refused it - check whether the "
+     "key has been rotated, or whether the bucket policy restricts it by path."),
+    (("unable to find migration token",),
+     "the repository password cannot be derived: its migration-token secret is gone",
+     "that secret is named <policy>-<hash>-migration-token and is deleted with the policy. The "
+     "data stays on the object store; k10tools cannot open it without the token."),
+]
+
+
+def diagnose_connect_failure(chain):
+    """Turn a k10tools cause chain into a one-line diagnosis plus what to do about it.
+
+    The chain can be ten levels deep and the actionable line is the innermost one, so a
+    report that prints only the outermost message ("failed to connect to repository") sends
+    the reader looking for a missing repository when the real answer is a trust store."""
+    blob = " ".join(chain).lower()
+    for needles, what, hint in CONNECT_DIAGNOSES:
+        if any(n in blob for n in needles):
+            return {"diagnosis": what, "hint": hint, "innermostCause": chain[-1] if chain else None}
+    return {"diagnosis": "repo_checker could not open the repository",
+            "hint": "read the innermost cause below; it is the actionable one.",
+            "innermostCause": chain[-1] if chain else None}
+
+
 def k10tools_cause_chain(text):
     """k10tools prints `Error: {"message":...,"cause":{...}}`; causes nest, and any level may be
     a JSON document encoded as a string or a message that is itself JSON. Return the flat
@@ -683,7 +726,9 @@ def k10tools_cause_chain(text):
                     return
                 except ValueError:
                     pass
-            out.append(st)
+            # k10tools embeds colour codes in the messages it nests; they survive JSON
+            # decoding and would otherwise reach the report as [31mERROR[0m
+            out.append(ANSI_RE.sub("", st).strip())
             return
         if isinstance(o, dict):
             if "message" in o:
@@ -802,6 +847,24 @@ def exported_history(kube):
                              "lastProcedure": last.get("procedure"), "lastProcessedAt": last.get("endTime"),
                              "lastProcedureSucceeded": last.get("succeeded")}
     return triples, repos
+
+
+def details_snapshot_index(pvcs):
+    """The change-rate denominator for a repository that could not be opened.
+
+    exports_for() needs, per export window, the logical size of the PVC snapshots that
+    export took. Kopia normally supplies it; without the repository the /details artifacts
+    do, and their uploadEndTime falls inside the ExportAction's window, so the same window
+    match works. Without this the denominator is 0 and the change rate reads as unavailable
+    even though K10's transferredBytes is right there."""
+    out = []
+    for p in pvcs or []:
+        for se in p.get("snapshots") or []:
+            d = parse_rfc3339(se.get("endTime"))
+            if d:
+                out.append({"t": epoch(d), "pvc": p.get("name"),
+                            "logicalBytes": se.get("totalSizeBytes") or 0})
+    return out
 
 
 def restore_points_from_details(kube, names, max_n=40):
@@ -1139,11 +1202,18 @@ class RepoChecker:
 
     @staticmethod
     def _connect_cause(out):
-        """k10tools reports connect failures as a JSON status block whose StatusMessage embeds
-        an escaped error chain. Return the chain's messages, innermost last."""
+        """The chain's messages, innermost last.
+
+        Two places carry it and only together do they reach the real cause: the JSON status
+        block's StatusMessage, and the `Error: {...}` block that k10tools_cause_chain walks.
+        Reading StatusMessage alone stopped at "failed to connect to repository" on a customer
+        cluster whose actual problem, ten levels down in the Error block, was
+        "x509: certificate signed by unknown authority".
+        """
+        deep = k10tools_cause_chain(out)
         m = re.search(r'"StatusMessage":\s*"(.*?)"\s*\n', out, re.S)
         if not m:
-            return []
+            return deep
         try:
             inner = m.group(1).encode().decode("unicode_escape")
             j = inner[inner.find("{"): inner.rfind("}") + 1]
@@ -1153,9 +1223,14 @@ class RepoChecker:
                 if d.get("message"):
                     chain.append(d["message"])
                 d = d.get("cause")
-            return chain
         except Exception:  # noqa: BLE001
-            return [m.group(1)[:200]]
+            chain = [m.group(1)[:200]]
+        # keep whichever reached further, then append anything the other adds
+        merged = list(chain if len(chain) >= len(deep) else deep)
+        for extra in (deep if len(chain) >= len(deep) else chain):
+            if extra not in merged:
+                merged.append(extra)
+        return merged
 
     def connect(self, application, profile):
         """Leave a debug-kopia pod connected read-only to the application repository.
@@ -1807,7 +1882,7 @@ def collect(args):
                            "note": "described from restore point details; the repository was not opened"},
             "pvcs": info.get("pvcs") or [], "policies": {info["policy"]} if info["policy"] != "-" else set(),
             "orphan": info, "_blobs": [], "_contents": [], "_rewrite_ts": None,
-            "_snapshot_times": [], "_snapshot_index": []}
+            "_snapshot_times": [], "_snapshot_index": details_snapshot_index(info.get("pvcs"))}
 
     # ---- per (namespace, profile): connect and read Kopia -----------------------------------
     cannot_open = []
@@ -1832,7 +1907,10 @@ def collect(args):
                                   "but repo_checker could not open it, so the figures below come "
                                   "from the restore point details instead of from Kopia"
                                   % hist.get("restorePoints", 0)))
-                describe_unopenable(ns, prof, info, [f"repo_checker could not open it: {cause}"])
+                diag = diagnose_connect_failure([c for c in cause.split(" -> ") if c])
+                info.update(diag)
+                describe_unopenable(ns, prof, info,
+                                    [diag["diagnosis"]] + ([diag["hint"]] if diag.get("hint") else []))
                 unopenable[(ns, prof)] = (info, info["cannotOpenBecause"])
                 cr = hist_repos.get((ns, prof)) or {}
                 ns_results[(ns, prof)] = {
@@ -1844,7 +1922,7 @@ def collect(args):
                                            "could not be opened"},
                     "pvcs": info.get("pvcs") or [], "policies": set(info["policies"]),
                     "orphan": info, "_blobs": [], "_contents": [], "_rewrite_ts": None,
-                    "_snapshot_times": [], "_snapshot_index": []}
+                    "_snapshot_times": [], "_snapshot_index": details_snapshot_index(info.get("pvcs"))}
             st.note = (f"{len(cannot_open)} pairs, "
                        f"{sum(len(unopenable[(n, pr)][0].get('pvcs') or []) for n, pr, _, _ in cannot_open)} PVCs described")
     # ExportActions are listed only now: the repositories were read over the last minutes
@@ -1877,8 +1955,12 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
                 # (which get the trust bundle) exported successfully every night. Calling
                 # that "never exported there" threw away a readable namespace, so it is now
                 # described from the restore point details instead.
+                d = diagnose_connect_failure([c for c in cause.split(" -> ") if c])
                 log(f"  {ns}/{prof}: {hist['restorePoints']} restore points exported here, but the "
-                    f"repository cannot be opened - describing it from the restore point details")
+                    f"repository cannot be opened - {d['diagnosis']}")
+                if d.get("innermostCause"):
+                    log(f"      cause: {d['innermostCause'][:220]}")
+                log(f"      describing it from the restore point details instead")
                 cannot_open.append((ns, prof, hist, cause))
             else:
                 log(f"  {ns}/{prof}: no repository on this profile ({cause.split(' -> ')[-1]}) "
@@ -2278,8 +2360,16 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                 # against earlier snapshots and compression pull it down, encryption adds a little.
                 # Numerator: K10's own transferredBytes when /details gave it, else Kopia's pack bytes.
                 num, basis = ex.get("exportedBytes"), "k10 transferredBytes"
-                if num is None and "packBytes" in (ex.get("written") or {}):
+                # Only fall back to Kopia pack bytes if the repository was actually read.
+                # Unopened, written_in_window sees no blobs and returns 0, which rendered as
+                # a change rate of 0.0 - "nothing changed" - instead of "not known".
+                opened = (res.get("repository") or {}).get("openable") is not False
+                if num is None and opened and "packBytes" in (ex.get("written") or {}):
                     num, basis = ex["written"]["packBytes"], "kopia pack bytes written in the window"
+                elif num is None and not opened:
+                    ex["changeRateNote"] = ("K10 recorded no transferred bytes for this export and "
+                                            "the repository could not be opened, so there is no "
+                                            "numerator - this is unknown, not zero")
                 if num is not None and src_bytes:
                     ex["changeRate"], ex["changeRateBasis"] = round(num / src_bytes, 4), basis
                 else:

@@ -317,49 +317,67 @@ def in_progress_block(ip):
             f'can resume; they are not restore points and are excluded from the counts.</div>')
 
 
+def unopenable_detail(o):
+    """Why the repository would not open, and what is therefore missing. Shared by both
+    banners: the reason is independent of whether the namespace is frozen."""
+    if o.get("openable") is not False:
+        return ""
+    out = ""
+    if o.get("diagnosis"):
+        out += f'<br><b>Why it would not open:</b> {esc(o["diagnosis"])}.'
+        if o.get("innermostCause"):
+            out += (f'<br><span class="muted"><b>Innermost cause:</b> '
+                    f'<code>{esc((o.get("innermostCause") or "")[:400])}</code></span>')
+        if o.get("hint"):
+            out += f'<br><span class="muted">{esc(o["hint"])}</span>'
+    out += ('<br><span class="muted">Not read here. Everything below is reconstructed from '
+            '<code>restorepointcontents/&lt;name&gt;/details</code>: the PVC, its storage class, '
+            'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio and '
+            'the file-size histogram would need the repository to be opened.</span>')
+    cr = o.get("storageRepository") or {}
+    if cr.get("lastProcessedAt"):
+        out += ('<br><span class="muted"><b>The repository itself is fine.</b> K10 last ran '
+                f'<code>{esc(cr.get("lastProcedure"))}</code> on it at '
+                f'{esc(fmt_ts(cr.get("lastProcessedAt")))}'
+                + (" successfully" if cr.get("lastProcedureSucceeded") else "")
+                + f' ({fmt_num(cr.get("processCount"))} operations in total), so K10 opens and '
+                  'maintains it. What is missing is a way for repo_checker to reach it.</span>')
+    return out
+
+
 def orphan_banner(o):
-    """A namespace the export policies do not account for. Either its policy or namespace has
-    been deleted - frozen, nothing will be added to it again - or it exported to a profile
-    the policy no longer targets, which is live data that simply is not where the policy
-    points. Say which before any figure below is read."""
+    """Why the export policies alone would not have found this namespace, and whether its
+    figures are current. Three independent states, and the reason it would not open has to
+    show in all of them - a live namespace whose repository fails on TLS is the case that
+    matters most and the one an "is it orphaned?" test misses."""
     if not o:
         return ""
-    if not (o.get("orphanedBy") or []):
-        return (f'<div class="note" style="border-left:3px solid var(--warning);padding-left:8px">'
-                f'<b>Not on the policy\'s current profile.</b> This namespace exported '
+    gone = o.get("orphanedBy") or []
+    detail = unopenable_detail(o)
+    box = 'class="note" style="border-left:3px solid var(--warning);padding-left:8px"'
+    st = o.get("detailStats") or {}
+    read = (f' <span class="muted">({st.get("restorePointsRead")} of '
+            f'{st.get("restorePointsAvailable")} restore points read)</span>' if st else "")
+
+    if gone:
+        return (f'<div {box}><b>Frozen — no longer exported.</b> The {esc(" and ".join(gone))} no '
+                f'longer exists, so this namespace stopped at its last restore point on '
+                f'{esc(fmt_ts(o.get("frozenSince")))} ({fmt_num(o.get("restorePoints"))} restore '
+                f'points, policy <code>{esc(o.get("policy"))}</code>){read}. The figures below are '
+                f'history, not a current state, and the data still occupies the object '
+                f'store.{detail}</div>')
+    if o.get("openable") is False:
+        return (f'<div {box}><b>The repository could not be opened.</b> This namespace exported '
                 f'{fmt_num(o.get("restorePoints"))} restore points here under policy '
                 f'<code>{esc(o.get("policy"))}</code>, most recently '
-                f'{esc(fmt_ts(o.get("newest")))}, but the policy does not target this profile '
-                f'any more. The data is live and read normally - it is simply not where the '
-                f'policy now points, so the export policies alone would not have found it.</div>')
-    gone = " and ".join(o.get("orphanedBy") or [])
-    why = o.get("cannotOpenBecause") or []
-    extra = ""
-    if o.get("openable") is False:
-        cr = o.get("storageRepository") or {}
-        alive = ""
-        if cr.get("lastProcessedAt"):
-            alive = ('<br><span class="muted"><b>The repository itself is fine.</b> K10 last ran '
-                     f'<code>{esc(cr.get("lastProcedure"))}</code> on it at '
-                     f'{esc(fmt_ts(cr.get("lastProcessedAt")))}'
-                     + (" successfully" if cr.get("lastProcedureSucceeded") else "")
-                     + f' ({fmt_num(cr.get("processCount"))} operations in total), so it is still being '
-                     'opened and maintained — including after the namespace was deleted. What is '
-                     'missing is a way to point repo_checker at it.</span>')
-        extra = ('<br><span class="muted">Not read here — '
-                 + esc("; ".join(why)) + '. Everything below is reconstructed from '
-                 '<code>restorepointcontents/&lt;name&gt;/details</code>: the PVC, its storage class, '
-                 'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio and '
-                 'the file-size histogram would need the repository to be opened.</span>' + alive)
-    st = o.get("detailStats") or {}
-    read = (f' <span class="muted">({st.get("restorePointsRead")} of {st.get("restorePointsAvailable")} '
-            f'restore points read)</span>' if st else "")
-    return (f'<div class="note" style="border-left:3px solid var(--warning);padding-left:8px">'
-            f'<b>Frozen — no longer exported.</b> The {esc(gone)} no longer exists, so this namespace '
-            f'stopped at its last restore point on {esc(fmt_ts(o.get("frozenSince")))} '
-            f'({fmt_num(o.get("restorePoints"))} restore points, policy <code>{esc(o.get("policy"))}</code>){read}. '
-            f'The figures below are history, not a current state, and the data still occupies the '
-            f'object store.{extra}</div>')
+                f'{esc(fmt_ts(o.get("newest")))}{read} — so the data is there and the exports are '
+                f'working. Only this tool could not read it.{detail}</div>')
+    return (f'<div {box}><b>Not on the policy\'s current profile.</b> This namespace exported '
+            f'{fmt_num(o.get("restorePoints"))} restore points here under policy '
+            f'<code>{esc(o.get("policy"))}</code>, most recently {esc(fmt_ts(o.get("newest")))}, '
+            f'but the policy does not target this profile any more. The data is live and read '
+            f'normally - it is simply not where the policy now points, so the export policies '
+            f'alone would not have found it.</div>')
 
 
 def reconstructed_runs_block(dm):
@@ -467,6 +485,7 @@ def pvc_row(p):
 
 
 def exports_table(exports):
+    # a note on an export means its change rate is unknown rather than zero
     if not exports:
         return '<div class="note">No ExportAction for this namespace and policy on the cluster — history may have been retired.</div>'
     rows = []
@@ -490,8 +509,13 @@ def exports_table(exports):
         else:
             source = '<span class="muted">–</span>'
         cr = e.get("changeRate")
-        rate = (f'<span title="{esc(e.get("changeRateBasis") or "")}">{cr * 100:.1f}%</span>'
-                if isinstance(cr, (int, float)) else '<span class="muted">–</span>')
+        if isinstance(cr, (int, float)):
+            rate = f'<span title="{esc(e.get("changeRateBasis") or "")}">{cr * 100:.1f}%</span>'
+        elif e.get("changeRateNote"):
+            # unknown, not zero - say which, because 0 % reads as "nothing changed"
+            rate = f'<span class="muted" title="{esc(e["changeRateNote"])}">unknown</span>'
+        else:
+            rate = '<span class="muted">–</span>' 
         rows.append([esc(fmt_ts(e.get("startTime"))), esc(fmt_dur(e.get("durationSeconds"))),
                      esc(e.get("state")), exported, source, rate, dm_cell(e.get("datamover"))])
     return (table(["Export start", "Duration", "State", "Exported", "Source (logical)", "Change rate",
@@ -547,8 +571,10 @@ def namespace_block(ns):
            f'<div style="margin:6px 0 2px">Maintenance: {maintenance_status(m)}'
            f'<span class="muted"> · quick every {ns_dur((m.get("quick") or {}).get("interval"))}, full every {ns_dur((m.get("full") or {}).get("interval"))}, next full {esc(fmt_ts(m.get("nextFullMaintenance")))}</span></div>')
         + f'{restamp_note}{aps_html}'
-        + ("" if repo.get("openable") is False else
-           f'<h3 style="margin-top:14px">Exports</h3>{exports_table(ns.get("exports"))}')
+        # The exports table needs no repository: ExportActions and their /details byte
+        # counters are cluster objects. Hiding it when the repository would not open
+        # removed the change rate - the headline figure - from a namespace that still had it.
+        + f'<h3 style="margin-top:14px">Exports</h3>{exports_table(ns.get("exports"))}'
         + f'<h3 style="margin-top:14px">PVCs</h3>{hdr}'
         + "".join(pvc_row(p) for p in ns.get("pvcs") or [])
         + reconstructed_runs_block((orphan or {}).get("datamover"))
