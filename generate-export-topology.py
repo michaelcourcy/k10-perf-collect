@@ -667,11 +667,12 @@ CONNECT_DIAGNOSES = [
     (("x509", "certificate signed by unknown authority", "failed to verify certificate",
       "certificate is valid for", "tls: "),
      "the object store's TLS certificate is not trusted inside the pod",
-     "repo_checker runs kopia in a k10tools/debug-kopia pod that it builds itself, and it does "
-     "not give that pod the profile's CA or the cluster trust bundle. K10's own pods do get "
-     "them, which is why exports keep succeeding while this fails. Either add the CA to the "
-     "pod's trust store, or set skipSSLVerify on the Location Profile - but note that only "
-     "fixes it if repo_checker honours the flag, which is worth checking rather than assuming."),
+     "set skipSSLVerify on the Location Profile: repo_checker does honour it - measured on a "
+     "self-signed endpoint, it passes the flag through to kopia and the connect then "
+     "succeeds, while with skipSSLVerify false the same repository will not open although "
+     "K10's own exports to it keep working. Adding the CA to the pod's trust store is the "
+     "alternative, but repo_checker builds that pod itself and gives it neither the "
+     "profile's CA nor the cluster trust bundle."),
     (("no such host", "server misbehaving", "dns"),
      "the object store endpoint does not resolve from inside the pod",
      "the endpoint in the Location Profile may be resolvable from K10's pods but not from this "
@@ -684,6 +685,13 @@ CONNECT_DIAGNOSES = [
      "the object store rejected the credentials",
      "the profile's credential secret is readable but the store refused it - check whether the "
      "key has been rotated, or whether the bucket policy restricts it by path."),
+    (("failed to find a profile with given location information",),
+     "K10 cannot match the repository to a Location Profile",
+     "this is not only the deleted-profile case: a profile that still exists but whose "
+     "validation FAILED is not matched either, so an untrusted TLS certificate or a rotated "
+     "key shows up here with no mention of the real cause. Check the profile's own "
+     "status.validation and status.error first - the chain there names it. Failing that, the "
+     "repository may have been written by another cluster; compare the UID in its path."),
     (("unable to find migration token",),
      "the repository password cannot be derived: its migration-token secret is gone",
      "that secret is named <policy>-<hash>-migration-token and is deleted with the policy. The "
@@ -691,28 +699,43 @@ CONNECT_DIAGNOSES = [
 ]
 
 
-def diagnose_connect_failure(chain):
+def diagnose_connect_failure(chain, profile=None):
     """Turn a k10tools cause chain into a one-line diagnosis plus what to do about it.
 
     The chain can be ten levels deep and the actionable line is the innermost one, so a
     report that prints only the outermost message ("failed to connect to repository") sends
-    the reader looking for a missing repository when the real answer is a trust store."""
-    blob = " ".join(chain).lower()
+    the reader looking for a missing repository when the real answer is a trust store.
+
+    `profile` is the Location Profile CR. Its own validation chain is matched too, because
+    repo_checker reports neither the certificate nor the credential: against a self-signed
+    endpoint its connect said only "failed to connect to repository" and its inventory only
+    "failed to find a profile with given location information", while the CR carried the
+    x509 line. Whichever side names the cause, the reader gets it."""
+    validation, pchain = profile_status(profile)
+    blob = " ".join(list(chain) + list(pchain)).lower()
+    out = {"diagnosis": "repo_checker could not open the repository",
+           "hint": "read the innermost cause below; it is the actionable one.",
+           "innermostCause": chain[-1] if chain else None}
     for needles, what, hint in CONNECT_DIAGNOSES:
         if any(n in blob for n in needles):
-            return {"diagnosis": what, "hint": hint, "innermostCause": chain[-1] if chain else None}
-    return {"diagnosis": "repo_checker could not open the repository",
-            "hint": "read the innermost cause below; it is the actionable one.",
-            "innermostCause": chain[-1] if chain else None}
+            out["diagnosis"], out["hint"] = what, hint
+            break
+    if validation is not None and validation != "Success":
+        out["profileValidation"] = validation
+        out["profileValidationCause"] = pchain[-1] if pchain else None
+        out["profileValidationChain"] = pchain
+        # A failed profile explains the failed connect on its own, and says so in plain
+        # terms - without this the report blames the repository for a broken profile.
+        out["note2"] = ("the Location Profile itself is in validation state %s, so K10 cannot "
+                        "open this repository either; fix the profile and the repository "
+                        "becomes readable again" % validation)
+    return out
 
 
-def k10tools_cause_chain(text):
-    """k10tools prints `Error: {"message":...,"cause":{...}}`; causes nest, and any level may be
-    a JSON document encoded as a string or a message that is itself JSON. Return the flat
-    list of messages, outermost first."""
-    m = re.search(r"^Error: (\{.*)$", ANSI_RE.sub("", text), re.M)
-    if not m:
-        return []
+def nested_cause_chain(blob):
+    """Flatten K10's nested {"message":..,"cause":{..}} error into a list of messages,
+    outermost first. Any level may be a JSON document encoded as a string, or a message that
+    is itself JSON. Shared by k10tools' stderr and the Profile CR's status.error."""
     out = []
 
     def walk(o, depth=0):
@@ -735,7 +758,60 @@ def k10tools_cause_chain(text):
                 walk(o["message"], depth + 1)
             if "cause" in o:
                 walk(o["cause"], depth + 1)
-    walk(m.group(1))
+    walk(blob)
+    return [m for m in out if m]
+
+
+def k10tools_cause_chain(text):
+    """k10tools prints `Error: {"message":...,"cause":{...}}` on stderr."""
+    m = re.search(r"^Error: (\{.*)$", ANSI_RE.sub("", text), re.M)
+    return nested_cause_chain(m.group(1)) if m else []
+
+
+def profile_status(prof_obj):
+    """(validation, cause chain) of a Location Profile.
+
+    This is where the TLS error actually is. repo_checker's own chain stops at "failed to
+    connect to repository" and its inventory stops at "failed to find a profile with given
+    location information" - neither mentions the certificate. K10 validates the profile with
+    a HeadBucket of its own and records the whole chain on the CR, down to
+    "tls: failed to verify certificate: x509: certificate signed by unknown authority".
+    Measured on a self-signed MinIO-style endpoint, 2026-10-06."""
+    if not isinstance(prof_obj, dict):
+        return None, []
+    st = prof_obj.get("status") or {}
+    chain = []
+    for e in st.get("error") or []:
+        chain.extend(nested_cause_chain(e))
+    return st.get("validation"), chain
+
+
+def profile_issues(profiles, policies):
+    """Location Profiles whose validation failed, with the cause and what they block.
+
+    Worth a section of its own: the failure is upstream of everything the report measures.
+    On a self-signed S3 endpoint the profile's chain ends "tls: failed to verify
+    certificate: x509: certificate signed by unknown authority", the export policy using it
+    goes validation Failed, its RunAction fails before a backup exists, and the namespace
+    then looks merely "never exported"."""
+    out = []
+    for name in sorted(profiles):
+        validation, chain = profile_status(profiles[name])
+        if validation is None or validation == "Success":
+            continue
+        blocks = sorted(set(pn for pn, pol in policies.items()
+                        for a in ((pol.get("spec") or {}).get("actions") or [])
+                        if a.get("action") == "export"
+                        and (((a.get("exportParameters") or {}).get("profile") or {}).get("name") == name)))
+        store = (((profiles[name].get("spec") or {}).get("locationSpec") or {}).get("objectStore") or {})
+        out.append({"profile": name, "validation": validation,
+                    "innermostCause": chain[-1] if chain else None, "causeChain": chain,
+                    "endpoint": store.get("endpoint"), "bucket": store.get("name"),
+                    "skipSSLVerify": store.get("skipSSLVerify"),
+                    "blocksExportPolicies": blocks,
+                    "effect": ("every export policy on this profile fails validation too, so no "
+                               "backup or export runs and the namespaces it covers look as if "
+                               "they had never been exported")})
     return out
 
 
@@ -867,7 +943,7 @@ def details_snapshot_index(pvcs):
     return out
 
 
-def restore_points_from_details(kube, names, max_n=40):
+def restore_points_from_details(kube, names, max_n=40, live_pvcs=None):
     """Describe an unopenable export from restorepointcontents/<name>/details alone.
 
     `repo_checker -o connect -a <namespace>` resolves the repository from the LIVE namespace
@@ -902,8 +978,13 @@ def restore_points_from_details(kube, names, max_n=40):
                 continue
             vals = {v.get("key"): v.get("value") for v in (kan.get("values") or [])}
             usage = (kan.get("meta") or {}).get("storageUsage") or {}
+            # The namespace is often gone here, but not always: a repository that will not
+            # open because its profile fails TLS validation belongs to a live namespace whose
+            # PVC is still there, and reporting it as absent sends the reader looking for
+            # deleted data.
             e = by_pvc.setdefault(pvc, {"name": pvc, "storageClass": vol.get("storageClassName"),
-                                        "existsOnCluster": False, "snapshots": [],
+                                        "existsOnCluster": pvc in (live_pvcs or ()),
+                                        "snapshots": [],
                                         "source": "restorepointcontent details"})
             def _int(x):
                 try:
@@ -1500,11 +1581,27 @@ def policy_targets(policies, namespaces, excluded):
         #   virtualMachineNamespace  In/NotIn  namespace globs; matchLabels then apply to VM
         #                                      labels, which we do not evaluate - the
         #                                      repository decides whether anything was exported
-        is_vm = any((e.get("key") or "").startswith("k10.kasten.io/virtualMachine") for e in exprs)
+        mlabels = sel.get("matchLabels") or {}
+        is_vm = (any((e.get("key") or "").startswith("k10.kasten.io/virtualMachine") for e in exprs)
+                 or any(k.startswith("k10.kasten.io/virtualMachine") for k in mlabels))
         include, exclude, label_terms = [], [], []
-        if not is_vm:
-            label_terms = list((sel.get("matchLabels") or {}).items())
         label_exprs = []
+        # matchLabels may carry the same K10 pseudo-keys as matchExpressions - a policy written
+        # as YAML commonly pins its namespace with `matchLabels: {k10.kasten.io/appNamespace: ns}`
+        # where the UI emits a matchExpressions `In`. Treating those as real namespace labels
+        # selects nothing, so the policy silently leaves the scope. Route them like an `In`.
+        for k, v in mlabels.items():
+            if k == "k10.kasten.io/appNamespace":
+                include.append(v)
+            elif k == "k10.kasten.io/virtualMachineRef":
+                if "/" in v:
+                    include.append(v.split("/", 1)[0])
+            elif k == "k10.kasten.io/virtualMachineNamespace":
+                include.append(v)
+            elif not k.startswith("k10.kasten.io/"):
+                label_terms.append((k, v))
+        if is_vm:
+            label_terms = []
         for e in exprs:
             k, op, vals = e.get("key"), e.get("operator"), e.get("values") or []
             if k == "k10.kasten.io/appNamespace":
@@ -1794,7 +1891,8 @@ def collect(args):
         """Fill in everything that does not need the repository to be opened: the PVCs and
         restore points from /details, and the datamover runs from Prometheus (those pods ran
         in the K10 namespace, so they survive whatever is wrong with the repository)."""
-        pvcs, stats = restore_points_from_details(kube, info.get("names") or [])
+        pvcs, stats = restore_points_from_details(kube, info.get("names") or [],
+                                                  live_pvcs=set(pvc_by_ns.get(ns, {})))
         info.update(pvcs=pvcs, detailStats=stats, openable=False, cannotOpenBecause=why,
                     describedFrom="restorepointcontents/<name>/details")
         if prom and prom.available and prom.retention_seconds:
@@ -1888,7 +1986,7 @@ def collect(args):
     cannot_open = []
     try:
         _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
-                           cannot_open)
+                           cannot_open, profiles)
     finally:
         rc.cleanup(wait=True)
 
@@ -1907,7 +2005,8 @@ def collect(args):
                                   "but repo_checker could not open it, so the figures below come "
                                   "from the restore point details instead of from Kopia"
                                   % hist.get("restorePoints", 0)))
-                diag = diagnose_connect_failure([c for c in cause.split(" -> ") if c])
+                diag = diagnose_connect_failure([c for c in cause.split(" -> ") if c],
+                                                 profiles.get(prof))
                 info.update(diag)
                 describe_unopenable(ns, prof, info,
                                     [diag["diagnosis"]] + ([diag["hint"]] if diag.get("hint") else []))
@@ -1938,7 +2037,7 @@ def collect(args):
 
 
 def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
-                       cannot_open):
+                       cannot_open, profiles=None):
     total = len(targets)
     for i, ((ns, prof), t) in enumerate(sorted(targets.items()), 1):
         log(f"[{i}/{total}] connecting to repository of {ns} on profile {prof} ...")
@@ -1955,11 +2054,18 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
                 # (which get the trust bundle) exported successfully every night. Calling
                 # that "never exported there" threw away a readable namespace, so it is now
                 # described from the restore point details instead.
-                d = diagnose_connect_failure([c for c in cause.split(" -> ") if c])
+                d = diagnose_connect_failure([c for c in cause.split(" -> ") if c],
+                                             (profiles or {}).get(prof))
                 log(f"  {ns}/{prof}: {hist['restorePoints']} restore points exported here, but the "
                     f"repository cannot be opened - {d['diagnosis']}")
                 if d.get("innermostCause"):
                     log(f"      cause: {d['innermostCause'][:220]}")
+                # repo_checker does not report the certificate; the Profile CR does, so print
+                # that line too or the reader never learns why the connect failed.
+                if d.get("profileValidation") and d["profileValidation"] != "Success":
+                    log(f"      profile {prof} validation: {d['profileValidation']}")
+                    if d.get("profileValidationCause"):
+                        log(f"      profile cause: {d['profileValidationCause'][:220]}")
                 log(f"      describing it from the restore point details instead")
                 cannot_open.append((ns, prof, hist, cause))
             else:
@@ -2474,6 +2580,11 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
         "notExported": not_exported,
         "scopeNotes": {"namespacesWithoutRestorePointSkipped": skipped_no_rp,
                        "k10NamespaceSkipped": "its export is the disaster-recovery repository, a different repository kind"},
+        # A Location Profile that fails validation stops everything downstream silently: the
+        # policy goes validation Failed, the RunAction fails before any backup, so the
+        # namespace has no restore point and is skipped as "never exported" with no hint of
+        # the real reason. Name the profiles and their cause.
+        "profilesFailingValidation": profile_issues(profiles, policies),
         "repositoriesWithoutVolumeData": [
             {"name": r.get("RepositoryName"), "type": r.get("Type"), "profile": r.get("ProfileName"),
              "totalSnapshots": r.get("TotalSnapshots")} for r in inv.get("repositories", []) if r.get("Type") != "Data"],

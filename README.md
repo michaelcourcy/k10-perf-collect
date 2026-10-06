@@ -267,6 +267,35 @@ Seven properties of the data worth knowing before reading the JSON:
   `metrics.podLabelsExposed` is `true`/`false`, and when false `metrics.attribution`
   says so and usage is reported per pod only.
 
+### When a repository will not open
+
+A pair whose repository `repo_checker` cannot open is **not** dropped. If the exported
+history proves data was written there, the report keeps the namespace and rebuilds its
+figures from `restorepointcontents/<name>/details` — PVC, storage class, Kopia snapshot id,
+file count and sizes all survive; only the object counts, the dedup ratio and the file-size
+histogram need the repository itself. The change rate then reads `unknown`, never `0`.
+
+The reason is reported, because `repo_checker` does not report it. Against a self-signed S3
+endpoint its `connect` says only `failed to connect to repository` and its `inventory` only
+`failed to find a profile with given location information`; neither output contains the
+string `x509`. The certificate error is on the **Location Profile**, as
+`status.validation: Failed` plus a `status.error` chain ending
+
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+so the generator matches both chains and prints the profile's validation state and innermost
+cause alongside the repository's. Note that
+`failed to find a profile with given location information` does not only mean the profile was
+deleted — a profile that still exists but failed validation is not matched either.
+
+The fix is `skipSSLVerify: true` on the Location Profile: `repo_checker` honours it, passing
+`--disable-tls-verification` through to kopia (measured on K10 9.0.1). Adding the CA to the
+pod's trust store is the alternative, but `repo_checker` builds that pod itself and gives it
+neither the profile's CA nor the cluster trust bundle — which is why exports can keep
+succeeding from K10's own pods while `repo_checker` fails.
+
 ## Example
 
 [`examples/audit-example.md`](examples/audit-example.md) is a worked audit on the reference

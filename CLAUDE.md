@@ -257,10 +257,38 @@ cluster; empty on the reference cluster) carries per repository the owning names
 path, region) - the generator enriches orphans from it. The abort reason varies and is
 only in k10tools' `Error: {json}` cause chain (`k10tools_cause_chain`; causes nest and
 may be string-encoded JSON): "failed to find a profile with given location information"
-(profile deleted, or a repository written by another cluster - compare the UID in the
-path), "unable to find migration token for repo location" (a migration metadata
-repository whose receive token secret is gone), ... Report the innermost cause verbatim
-plus the CR facts; do not infer the reason from the path.
+(profile deleted, **or still present but in validation state Failed**, or a repository
+written by another cluster - compare the UID in the path), "unable to find migration token
+for repo location" (a migration metadata repository whose receive token secret is gone),
+... Report the innermost cause verbatim plus the CR facts; do not infer the reason from the
+path.
+
+### repo_checker never names the TLS certificate; the Profile CR does
+
+Measured 2026-10-06 against a self-signed S3 endpoint (SeaweedFS with a cert whose issuer
+is itself):
+
+| Question | Answer |
+|---|---|
+| Does repo_checker honour `skipSSLVerify`? | **Yes.** With it set, the kopia command it builds carries `--disable-tls-verification` and the connect succeeds; without it, the same repository will not open. This is the fix to recommend. |
+| Does repo_checker say *why*? | **No.** `-o connect` stops at `failed to connect to repository` (`utils.go:1168`, no deeper cause) and `-r inventory` stops at `failed to find a profile with given location information`. Neither output contains the string `x509` anywhere. |
+| Where is the x509 text? | On the **Profile CR**: `status.validation: Failed` and `status.error[]`, whose chain ends `tls: failed to verify certificate: x509: certificate signed by unknown authority`. |
+
+So `diagnose_connect_failure(chain, profile)` matches the k10tools chain **and** the
+profile's own chain (`profile_status`), and the report prints the profile's validation state
+and innermost cause next to the repository's. Without that the page blames the repository
+for a broken profile.
+
+A profile whose validation failed also stops K10 itself: the policy goes `validation:
+Failed` and the RunAction fails before any export action is created. The customer's
+asymmetry (exports succeed nightly, repo_checker fails on x509) therefore needs K10's own
+pods to hold the CA - OpenShift trust-bundle injection - while repo_checker's pod does not.
+To reproduce "data present but unopenable" on a cluster where K10 does not trust the CA
+either, export with `skipSSLVerify: true` and then turn it off.
+
+MinIO images are no longer anonymously pullable (`quay.io/minio/minio` and
+`docker.io/minio/minio` both 401). Use `docker.io/chrislusf/seaweedfs` with
+`-s3.cert.file` / `-s3.key.file` for a TLS S3 repro.
 
 A focused run (`--namespace NS --policy P`) skips the full inventory and inventories
 only the profiles of its pairs (`RepoChecker.inventory(..., full=False)`); the renderer
@@ -311,6 +339,7 @@ Do not re-derive these; do not contradict them without re-testing.
 | Kopia checkpoints | `snapshot list --all` includes the incomplete manifests Kopia writes every 45 min during a long upload (`incomplete: "checkpoint"`, same `startTime` as the running snapshot, `stats.fileCount` 0). They are not restore points: exclude them from counts and deltas, report them as `inProgress`. Seen as "3 snapshots with the same timestamp" on a 5 M-file export. |
 | Change rate ~100 % on every export | Before doubting the counters, look at the workload: the 5 M-file calibration pod crash-looped on **inode exhaustion** (74 GiB ext4 = 4,849,664 inodes at the default 16 KiB ratio; `df -i` 100 % with blocks at 77 %), died before its `touch initial` marker and regenerated every file from scratch each restart (~2 h 40), so each export really was ~100 % new data. K10's `readBytes`/`processedBytes`/`transferredBytes` and Kopia's hashed/unchanged agreed. Also: Kopia's incremental base can be a *checkpoint* of a failed export, so `filesUnchanged` may exceed the previous complete snapshot's file count. |
 | Small-file PVCs | A "stuck" export at a few MB/s with `progressDetails.updatedTime` current is usually file-count-bound: Kopia hashes/uploads with `--parallel=8` but enumerates and `stat`s **serially within a directory** (concurrently across directories), ~1 random read per file on a fresh clone (cold cache; on Azure also background hydration of the snapshot-restored disk), so with few huge directories a latency-bound disk (Azure Premium P10 ≈ 3–4 ms) gives ~250–375 entries/s whatever the file size - check `dirCount` next to `fileCount` (5 M files, `dirCount` 2 here) (observed: 10 kB files → 3 MB/s, 500 kB files → 87 MB/s, same profile). Confirm with cAdvisor `container_fs_reads_total{pod="copy-vol-data-…"}` ÷ container uptime and the clone volume's `inodesUsed` in `stats/summary`. Millions of files also cost minutes of SELinux relabel before the container starts (events: `stage container volume configuration`, one retry, restartCount 1 without lastState). Block-mode export is the remedy, not tuning. |
+| Policy selectors | `matchLabels` may carry the same K10 pseudo-keys as `matchExpressions` - a hand-written policy commonly pins its namespace with `matchLabels: {k10.kasten.io/appNamespace: ns}` where the UI emits an `In` expression. Evaluating those against real namespace labels selects **nothing**, and the policy silently leaves the scope (then reappears via the exported history, mislabelled "the policy does not target this profile any more"). |
 | Scope pre-filter | A namespace with no RestorePoint was never backed up, hence never exported — skip it before a connect. `virtualMachineNamespace In ["*"]` otherwise expands to every namespace (47 on a lab cluster; 18 after the filter). |
 
 ## Secrets

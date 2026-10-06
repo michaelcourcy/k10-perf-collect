@@ -330,6 +330,17 @@ def unopenable_detail(o):
                     f'<code>{esc((o.get("innermostCause") or "")[:400])}</code></span>')
         if o.get("hint"):
             out += f'<br><span class="muted">{esc(o["hint"])}</span>'
+    # The Location Profile's own validation error is usually the only place the real cause
+    # is named - repo_checker reports neither the certificate nor the credential.
+    pv = o.get("profileValidation")
+    if pv and pv != "Success":
+        out += (f'<br><b>The Location Profile <code>{esc(o.get("profile"))}</code> is itself in '
+                f'validation state {esc(pv)}.</b>')
+        if o.get("profileValidationCause"):
+            out += (f'<br><span class="muted"><b>Profile cause:</b> '
+                    f'<code>{esc((o.get("profileValidationCause") or "")[:500])}</code></span>')
+        if o.get("note2"):
+            out += f'<br><span class="muted">{esc(o["note2"])}</span>'
     out += ('<br><span class="muted">Not read here. Everything below is reconstructed from '
             '<code>restorepointcontents/&lt;name&gt;/details</code>: the PVC, its storage class, '
             'the Kopia snapshot id, the file count and the sizes. Object counts, dedup ratio and '
@@ -701,6 +712,11 @@ def focus(t, policies=None, namespaces=None):
     out["unopenableRepositories"] = [x for x in t.get("unopenableRepositories") or []
                                      if (not namespaces or x.get("namespace") in namespaces)
                                      and (not policies or x.get("policy") in policies)]
+    # a failing profile is kept whenever it blocks one of the policies in view - it is the
+    # reason the focused namespace shows nothing, so filtering it out hides the answer
+    out["profilesFailingValidation"] = [x for x in t.get("profilesFailingValidation") or []
+                                        if not policies
+                                        or set(x.get("blocksExportPolicies") or []) & set(policies)]
     parts = []
     if policies:
         parts.append("polic" + ("y " if len(policies) == 1 else "ies ") + ", ".join(policies))
@@ -769,14 +785,19 @@ def render(t, banner=None):
         warn_html += ('<details class="card warn-box" open><summary><b>Exported data that can no longer be opened</b> '
                       f'<span class="sub">{len(uo)} — described from the restore point details; '
                       'the data is still on the object store</span></summary>'
-                      '<div class="note"><code>repo_checker -o connect</code> only accepts '
+                      '<div class="note">Three different situations end up here, and the per-namespace '
+                      'banner below says which one applies. <b>The namespace is gone:</b> '
+                      '<code>repo_checker -o connect</code> only accepts '
                       '<code>-a &lt;namespace&gt; -p &lt;profile&gt;</code> and resolves the repository by looking that '
-                      'namespace up, so once the namespace is deleted it cannot be pointed at the repository. '
-                      'That is a limit of the tool, not of the data: the StorageRepository CR still records the '
-                      'resolved path, whose last segment is the deleted namespace\'s UID, and K10 goes on opening '
-                      'and maintaining the repository (see the maintenance dates below). A deleted <b>profile</b> is '
-                      'the harder case — the credentials and the repository password go with it. '
-                      '<code>restorepointcontents/&lt;name&gt;/details</code> is cluster-scoped and survives both, so the '
+                      'namespace up, so it cannot be pointed at the repository any more. That is a limit of the '
+                      'tool, not of the data — the StorageRepository CR still records the resolved path, whose last '
+                      'segment is the deleted namespace\'s UID, and K10 goes on opening and maintaining the '
+                      'repository (see the maintenance dates below). <b>The profile is gone:</b> the harder case, '
+                      'because the credentials and the repository password go with it. <b>The namespace and the '
+                      'profile both still exist:</b> then the profile itself is usually what is broken — an '
+                      'untrusted TLS certificate or a rotated key — and its validation state and cause are quoted '
+                      'in the banner. In all three cases '
+                      '<code>restorepointcontents/&lt;name&gt;/details</code> is cluster-scoped and survives, so the '
                       'PVCs, Kopia snapshot ids and sizes below come from there.</div>'
                       + table(["Namespace", "Policy", "Profile", "Gone", "Restore points", "Frozen since",
                                "K10 last worked on it"],
@@ -787,6 +808,27 @@ def render(t, banner=None):
                                             f'<span class="muted">{esc(c.get("lastProcedure") or "")}</span>')
                                  if c.get("lastProcessedAt") else '<span class="muted">–</span>')(x.get("storageRepository") or {})]
                                for x in uo], num_cols=(4,))
+                      + '</details>')
+    pf = t.get("profilesFailingValidation") or []
+    if pf:
+        warn_html += ('<details class="card warn-box" open><summary><b>Location Profiles that fail validation</b> '
+                      f'<span class="sub">{len(pf)} — upstream of everything below</span></summary>'
+                      '<div class="note">A profile in validation state <code>Failed</code> stops the whole chain '
+                      'silently: every export policy on it also goes <code>Failed</code>, its runs fail before a '
+                      'backup exists, and the namespaces it covers then look merely <i>never exported</i>. The cause '
+                      'is only on the profile, so it is reported here. Note that <code>repo_checker</code> does not '
+                      'repeat it — its connect stops at <code>failed to connect to repository</code> and its '
+                      'inventory at <code>failed to find a profile with given location information</code>, neither of '
+                      'which mentions a certificate.</div>'
+                      + table(["Profile", "State", "Endpoint", "Bucket", "skipSSLVerify", "Blocks policies", "Innermost cause"],
+                              [[f'<code>{esc(x.get("profile"))}</code>',
+                                f'<b>{esc(x.get("validation"))}</b>',
+                                f'<span class="muted">{esc(x.get("endpoint") or "–")}</span>',
+                                esc(x.get("bucket") or "–"),
+                                esc("true" if x.get("skipSSLVerify") else "false"),
+                                esc(", ".join(x.get("blocksExportPolicies") or []) or "–"),
+                                f'<code>{esc((x.get("innermostCause") or "")[:300])}</code>']
+                               for x in pf])
                       + '</details>')
     ne = t.get("notExported") or []
     if ne:
