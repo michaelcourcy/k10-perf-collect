@@ -38,6 +38,13 @@ import ssl
 import subprocess
 import threading
 import sys
+
+# Customers run this with whatever python3 the node has - a RHEL host gave 3.6.8. f-strings
+# need 3.6, and nothing here needs more, so fail with a sentence rather than a traceback.
+if sys.version_info < (3, 6):
+    raise SystemExit("this script needs python 3.6 or newer; found %s. "
+                     "Try python3.8/python3.9 if the host has one."
+                     % sys.version.split()[0])
 import tempfile
 import time
 import urllib.error
@@ -163,7 +170,11 @@ class Kube:
         if self.context:
             cmd += ["--context", self.context]
         cmd += list(args)
-        r = subprocess.run(cmd, capture_output=True, text=True, input=stdin, timeout=timeout)
+        # capture_output= and text= are Python 3.7+; these are their 3.6-compatible
+        # equivalents. Customers run this on whatever python3 the node has - a RHEL
+        # host gave 3.6.8 and the 3.7 spelling died with "unexpected keyword argument".
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, input=stdin, timeout=timeout)
         if check and r.returncode != 0:
             raise RuntimeError(f"{' '.join(cmd[:6])}...: {r.stderr.strip()[:300]}")
         return r
@@ -972,7 +983,7 @@ class RepoChecker:
         if self.image_registry:
             extra += ["-i", self.image_registry]
         proc = subprocess.Popen([os.path.abspath(self.path), *args, *extra], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, env=env, cwd=self.workdir)
+                                universal_newlines=True, env=env, cwd=self.workdir)
         lines, last = [], {"line": "", "seen": time.monotonic(), "printed": time.monotonic()}
 
         def reader():

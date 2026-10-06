@@ -174,9 +174,13 @@ files of 512 KB, known 20 % rewrite per cycle — all three change-rate methods 
 ## The generator
 
 `generate-export-topology.py` is the automated counterpart of guides 01–13: one JSON
-document per cluster, built only from what the Kopia repositories contain. Python 3
+document per cluster, built only from what the Kopia repositories contain. Python 3.6+
 stdlib only, `kubectl` + `helm` via subprocess, no third-party modules — customers run
-it where they cannot pip-install. It reuses the guides' findings; when a guide learns
+it where they cannot pip-install. **3.6 is the floor, and it bites**: `capture_output=`
+and `text=` on `subprocess` are 3.7+, and a RHEL 3.6.8 host died with
+`__init__() got an unexpected keyword argument 'capture_output'`. Use
+`stdout=PIPE, stderr=PIPE, universal_newlines=True`. Check new code with
+`ast.parse(src, feature_version=(3, 6))`, which catches syntax but not APIs. It reuses the guides' findings; when a guide learns
 something new about a data source, mirror it in the script, and vice versa.
 
 Validate a change by running it against a live cluster and checking the debug pods are

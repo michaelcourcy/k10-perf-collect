@@ -38,7 +38,9 @@ not appear:
 ./generate-export-topology.py --context <kube-context> -o export-topology.json
 ```
 
-Requires `python3` (stdlib only), `kubectl` and `helm` in `PATH`. It downloads the
+Requires `python3` **3.6 or newer** (stdlib only), `kubectl` and `helm` in `PATH`. 3.6 is
+the floor on purpose: customers run this on whatever the node has, and a RHEL host gave
+3.6.8. Nothing here needs more. It downloads the
 `k10_repo_checker.sh` matching the cluster's K10 version, runs the inventory, connects
 read-only to each application repository, reads Kopia's snapshot, content, blob and
 maintenance data, and joins in the K10 objects (policies, profiles, ActionPodSpecs,
