@@ -1608,19 +1608,36 @@ def collect(args):
             gone.append("policy")
         if ns not in {n["metadata"]["name"] for n in all_ns}:
             gone.append("namespace")
-        if not gone:
-            continue  # still live: policy_targets already has it, or it is simply not selected any more
+        # A pair that policy_targets already covers needs nothing from the history.
+        # A pair it does NOT cover must still be added even when the policy and the
+        # namespace are both alive: policy_targets only ever yields a policy's CURRENT
+        # profile, so a namespace that exported to a profile the policy has since stopped
+        # targeting is invisible to it. Seen on a customer cluster at K10 8.5.12 - two
+        # profiles, the policy pointing at the second, the data in the first: the live pair
+        # failed to connect with "never exported there", the history held the real pair, and
+        # discarding it here produced a report with 0 policies from 1,616 restore points.
+        if (ns, prof) in targets:
+            continue
         cr = hist_repos.get((ns, prof))
         # A frozen entry, not a live one: with the policy or the namespace gone nothing will
         # export here again, so the newest restore point is the date the data stopped moving.
         # Everything else in this namespace's section - sizes, file counts, change rates - is
         # history as of that date and will not change.
-        info = dict(info, orphanedBy=gone, policy=pol, profileExistsOnCluster=prof in profiles,
-                    storageRepository=cr, frozenSince=info.get("newest"),
-                    note=("no longer exported: the " + " and ".join(gone) +
-                          " no longer exists, so this namespace is frozen at its last restore "
-                          "point and the figures below are history, not a current state. The "
-                          "data still occupies the object store."))
+        if gone:
+            info = dict(info, orphanedBy=gone, policy=pol, profileExistsOnCluster=prof in profiles,
+                        storageRepository=cr, frozenSince=info.get("newest"),
+                        note=("no longer exported: the " + " and ".join(gone) +
+                              " no longer exists, so this namespace is frozen at its last restore "
+                              "point and the figures below are history, not a current state. The "
+                              "data still occupies the object store."))
+        else:
+            # live, readable, just not on the profile the policy points at today
+            info = dict(info, orphanedBy=[], policy=pol, profileExistsOnCluster=prof in profiles,
+                        storageRepository=cr, offCurrentProfile=True,
+                        note=("this namespace exported to profile %s, which its policy does not "
+                              "target any more. The data is on the object store and is read "
+                              "normally; the policy's current profile is reported separately."
+                              % prof))
         if (ns, prof) in targets:
             targets[(ns, prof)]["orphan"] = info
             continue
@@ -1633,13 +1650,26 @@ def collect(args):
     for k, v in targets.items():
         v["cr"] = hist_repos.get(k)
     if orphan_pairs:
+        n_gone = sum(1 for i in orphan_pairs.values() if i["orphanedBy"])
+        n_off = len(orphan_pairs) - n_gone
         for (ns, prof), info in sorted(orphan_pairs.items()):
-            warn(f"{ns}/{prof}: exported {info['restorePoints']} restore points by policy "
-                 f"{info['policy']} but the {' and '.join(info['orphanedBy'])} no longer exists"
-                 + ("" if info["profileExistsOnCluster"] else
-                    f"; profile {prof} is gone too, so the repository cannot be opened"))
-        log(f"scope from exported history: {len(orphan_pairs)} further pairs whose policy or "
-            f"namespace is gone - their data is still on the object store")
+            if info["orphanedBy"]:
+                warn(f"{ns}/{prof}: exported {info['restorePoints']} restore points by policy "
+                     f"{info['policy']} but the {' and '.join(info['orphanedBy'])} no longer exists"
+                     + ("" if info["profileExistsOnCluster"] else
+                        f"; profile {prof} is gone too, so the repository cannot be opened"))
+            else:
+                warn(f"{ns}/{prof}: exported {info['restorePoints']} restore points by policy "
+                     f"{info['policy']} to this profile, which the policy does not target any "
+                     f"more - adding it to the scope, because the policy's current profile is "
+                     f"not where this data is")
+        bits = []
+        if n_gone:
+            bits.append(f"{n_gone} whose policy or namespace is gone")
+        if n_off:
+            bits.append(f"{n_off} on a profile the policy no longer targets")
+        log(f"scope from exported history: {len(orphan_pairs)} further pairs ("
+            f"{', '.join(bits)}) - their data is on the object store")
 
     # A pair whose PROFILE is gone cannot be opened at all - the profile holds the
     # credentials and the repository password - so do not spend a k10tools run on it.

@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import sys
 
 # ------------------------------------------------------------------ formatting helpers
 
@@ -317,10 +318,20 @@ def in_progress_block(ip):
 
 
 def orphan_banner(o):
-    """A namespace whose policy or namespace has been deleted: the data is still on the
-    object store but nothing will ever be added to it. Say so before any figure is read."""
+    """A namespace the export policies do not account for. Either its policy or namespace has
+    been deleted - frozen, nothing will be added to it again - or it exported to a profile
+    the policy no longer targets, which is live data that simply is not where the policy
+    points. Say which before any figure below is read."""
     if not o:
         return ""
+    if not (o.get("orphanedBy") or []):
+        return (f'<div class="note" style="border-left:3px solid var(--warning);padding-left:8px">'
+                f'<b>Not on the policy\'s current profile.</b> This namespace exported '
+                f'{fmt_num(o.get("restorePoints"))} restore points here under policy '
+                f'<code>{esc(o.get("policy"))}</code>, most recently '
+                f'{esc(fmt_ts(o.get("newest")))}, but the policy does not target this profile '
+                f'any more. The data is live and read normally - it is simply not where the '
+                f'policy now points, so the export policies alone would not have found it.</div>')
     gone = " and ".join(o.get("orphanedBy") or [])
     why = o.get("cannotOpenBecause") or []
     extra = ""
@@ -800,7 +811,19 @@ def main():
         topo = json.load(f)
     topo, banner = focus(topo, args.policy, args.namespace)
     if not topo.get("policies"):
-        raise SystemExit("nothing matches the requested policy/namespace filter")
+        # Do NOT exit. A collection with no policies is the case that most needs a page:
+        # the nodes, limiters, warnings, notExported and scope notes in that file are
+        # exactly what explain why it is empty. Exiting here sent a customer chasing a
+        # filter they had not passed.
+        why = ("no policy or namespace matched --policy/--namespace"
+               if (args.policy or args.namespace) else
+               "the collection itself found no exported namespace")
+        banner = (f"Nothing to report: {why}. "
+                  + ("Filter: " + json.dumps({"policies": args.policy, "namespaces": args.namespace}) + ". "
+                     if (args.policy or args.namespace) else "")
+                  + "The sections below are what the collection did find, and the warnings and "
+                    "'selected but never exported' list say why there is nothing else.")
+        print(f"warning: {why}; rendering the diagnostic page anyway", file=sys.stderr)
     out = render(topo, banner)
     with open(args.output, "w") as f:
         f.write(out)
