@@ -837,6 +837,39 @@ def render(t, banner=None):
                       + table(["Namespace", "Profile", "Policies"],
                               [[esc(x.get("namespace")), esc(x.get("profile")), esc(", ".join(x.get("policies") or []))] for x in ne])
                       + '</details>')
+    # A namespace asked for with --namespace that produced nothing must still appear, with
+    # the reason. Otherwise it simply vanishes from the page and the reader cannot tell
+    # "nothing to report" from "I mistyped it" - and the commonest reason, a Location Profile
+    # that fails validation so the policy never runs, is three sections away.
+    skipped = set((t.get("scopeNotes") or {}).get("namespacesWithoutRestorePointSkipped") or [])
+    requested = (t.get("filter") or {}).get("namespaces") or []
+    shown = set()
+    for pol in t.get("policies") or []:
+        for n in pol.get("namespaces") or []:
+            shown.add(n.get("name"))
+    for x in (t.get("unopenableRepositories") or []) + (t.get("orphanedRepositories") or []):
+        shown.add(x.get("namespace"))
+    silent, seen_s = [], set()
+    for n in list(requested) + sorted(skipped - set(requested)):
+        if n and n not in shown and n not in seen_s:
+            seen_s.add(n)
+            silent.append(n)
+    if silent:
+        warn_html += ('<details class="card warn-box" open><summary><b>Namespaces with nothing to report</b> '
+                      f'<span class="sub">{len(silent)} — asked for, or selected, but no exported data was found</span></summary>'
+                      '<div class="note">These have no section of their own below. A namespace with no '
+                      'RestorePoint was never backed up, so it was never exported and there is no repository '
+                      'to read — but check the profile first: a Location Profile in validation state '
+                      '<code>Failed</code> makes every policy on it fail too, so the runs never happen and the '
+                      'namespace looks untouched when the real fault is upstream.</div>'
+                      + table(["Namespace", "Why nothing is reported"],
+                              [[esc(n),
+                                ('no RestorePoint — never backed up, hence never exported'
+                                 if n in skipped else
+                                 'no policy with an enabled export action selects it, and no exported '
+                                 'restore point names it')]
+                               for n in silent])
+                      + '</details>')
     extra = t.get("repositoriesWithoutVolumeData") or []
     extra_html = ""
     if extra:
