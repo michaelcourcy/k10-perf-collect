@@ -237,8 +237,8 @@ The namespace case is a **tool limit, not a data limit**, and the report must sa
 `repo_checker -o connect` only accepts `-a <namespace> -p <profile>` and resolves the
 repository by looking that namespace up. The path is not lost: `StorageRepository`
 `status.location.objectStore.path` records it, and its last segment **is** the namespace
-UID (verified against live namespaces: `cnpg-test` UID `97e94d2a-…` appears as
-`…/migration/repo/97e94d2a-…/`). K10 itself keeps opening the repository - on the
+UID (verified against live namespaces: a namespace's own UID appears verbatim as the
+path's last segment, `…/migration/repo/<that namespace UID>/`). K10 itself keeps opening the repository - on the
 reference cluster the CR's `status.processResults` showed a successful `MaintenanceRun`
 the day *after* the namespace was deleted, 372 operations in total. Only a deleted
 **profile** makes a repository genuinely unreadable, because the credentials and the
