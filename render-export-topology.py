@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import re
 import sys
 
 # ------------------------------------------------------------------ formatting helpers
@@ -159,6 +160,56 @@ footer { color: var(--muted); font-size: 12px; margin-top: 40px; }
 
 # ------------------------------------------------------------------ pieces
 
+def ns_anchor(ns):
+    """Stable id for a namespace card, so the summary at the top can jump straight to it."""
+    key = "%s--%s" % (ns.get("name") or "", ((ns.get("repository") or {}).get("profile") or ""))
+    return "ns-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", key).strip("-").lower()
+
+
+def highlights_block(nss):
+    """The two questions a reader of a 60-namespace report actually arrives with: what took
+    longest, and what ate the most memory. Both are per ExportAction, and each row links to
+    the namespace card it belongs to - otherwise finding it means scrolling past everything."""
+    rows = []
+    for n in nss:
+        for e in n.get("exports") or []:
+            dm = e.get("datamover") or {}
+            rows.append({"ns": n.get("name"), "anchor": ns_anchor(n),
+                         "profile": (n.get("repository") or {}).get("profile"),
+                         "start": e.get("startTime"), "dur": e.get("durationSeconds"),
+                         "mem": dm.get("peakSumMemoryBytes"), "state": e.get("state"),
+                         "pvcs": len((e.get("source") or {}).get("pvcs") or [])})
+    if not rows:
+        return ""
+
+    def tbl(key, label, fmt):
+        top = [r for r in rows if r.get(key) is not None]
+        top.sort(key=lambda r: r[key], reverse=True)
+        top = top[:5]
+        if not top:
+            return (f'<div><figcaption>{esc(label)}</figcaption>'
+                    f'<div class="note">no {esc(label.lower())} available</div></div>')
+        return (f'<div><figcaption>{esc(label)}</figcaption>'
+                + table(["Namespace", "Export start", label.split(" ")[-1].capitalize(), "PVCs"],
+                        [[f'<a href="#{esc(r["anchor"])}">{esc(r["ns"])}</a>',
+                          esc(fmt_ts(r["start"])), fmt(r[key]), fmt_num(r["pvcs"])]
+                         for r in top], num_cols=(2, 3))
+                + '</div>')
+
+    return ('<details class="card" open><summary><b>Where to look first</b> '
+            f'<span class="sub">the 5 slowest and the 5 heaviest ExportActions of '
+            f'{len(rows)} — click a namespace to jump to it</span></summary>'
+            '<div class="two">'
+            + tbl("dur", "Longest exports by duration", lambda v: esc(fmt_dur(v)))
+            + tbl("mem", "Heaviest exports by peak memory", lambda v: esc(fmt_bytes(v)))
+            + '</div>'
+            '<div class="note">Duration is the ExportAction\'s own start to end. Peak memory is the '
+            'peak of the sum over every datamover pod alive in that export\'s window, so it includes '
+            'concurrent exports of other namespaces - the per-export cell on the namespace card '
+            'breaks that down. An export with no datamover samples cannot be ranked by memory and '
+            'is left out of the right-hand table.</div></details>')
+
+
 def tile(label, value, note=None):
     return (f'<div class="tile"><div class="label">{esc(label)}</div>'
             f'<div class="value">{esc(value)}</div>'
@@ -185,8 +236,19 @@ def maintenance_status(m):
 
 
 def table(headers, rows, num_cols=()):
-    """headers: list of str; rows: list of list of (already escaped) cell html."""
-    th = "".join(f'<th class="{"num" if i in num_cols else ""}">{esc(h)}</th>' for i, h in enumerate(headers))
+    """headers: list of str, or (text, tooltip) for a column that needs explaining; rows:
+    list of list of (already escaped) cell html.
+
+    Headers stay escaped - passing raw HTML in to get a tooltip printed the markup
+    verbatim in the header cell."""
+    def th_cell(i, h):
+        tip = ""
+        if isinstance(h, (tuple, list)):
+            h, tip = h[0], h[1]
+        cls = "num" if i in num_cols else ""
+        title = f' title="{esc(tip)}"' if tip else ""
+        return f'<th class="{cls}"{title}>{esc(h)}</th>'
+    th = "".join(th_cell(i, h) for i, h in enumerate(headers))
     body = ""
     for r in rows:
         body += "<tr>" + "".join(f'<td class="{"num" if i in num_cols else ""}">{c}</td>' for i, c in enumerate(r)) + "</tr>"
@@ -404,8 +466,11 @@ def reconstructed_runs_block(dm):
         return f'<div class="note">{esc(dm.get("note") or "no datamover metrics for this namespace")}</div>'
     # chronological, newest first - the same order as every other table in the report
     top = sorted(runs, key=lambda r: r.get("windowStart") or "", reverse=True)[:12]
+    # the count alone left "what are these pods?" unanswerable - name them
     rows = [[esc(fmt_ts(r.get("windowStart"))), esc(fmt_dur(r.get("durationSeconds"))),
-             fmt_num(len(r.get("pods") or [])), fmt_bytes(r.get("peakSumMemoryBytes")),
+             (f'<span title="{esc(", ".join(r.get("pods") or []))}">'
+              f'{fmt_num(len(r.get("pods") or []))}</span>'),
+             fmt_bytes(r.get("peakSumMemoryBytes")),
              f'{r.get("cpuSecondsTotal")} <span class="muted">cpu-s</span>',
              (f'{r["avgCpuCores"]} <span class="muted">cores avg</span>'
               if r.get("avgCpuCores") is not None
@@ -414,11 +479,18 @@ def reconstructed_runs_block(dm):
     more = f", {len(top)} most recent shown" if len(runs) > len(top) else ""
     return ('<figcaption style="margin-top:12px">Datamover runs reconstructed from the pods '
             f'({len(runs)} found{more})</figcaption>'
-            + table(["Window start", "Duration", "Pods", "Peak memory", "CPU", "Average"],
+            + table(["Window start", "Duration",
+                      ("Pods", "how many distinct datamover pods were alive in this window - "
+                               "hover a number to see their names. A run has one data-mover-svc "
+                               "pod plus one copy-vol-data pod per PVC it exports."),
+                      "Peak memory", "CPU", "Average"],
                     rows, num_cols=(2, 3, 4, 5))
             + f'<div class="note">{esc(dm.get("note") or "")} Each figure is a floor: a pod alive '
               'for less than one scrape interval leaves no sample, and the window is the span over '
-              'which the pods were scraped, not the ExportAction\'s own start and end.</div>')
+              'which the pods were scraped, not the ExportAction\'s own start and end. '
+              'Pods are attributed per job, not per PVC: <code>copy-vol-data-*</code> pods carry only '
+              'the job id and the clone they read does not name its source PVC, so a pod cannot be '
+              'tied to the one PVC it exported.</div>')
 
 
 def details_snapshots_table(snaps):
@@ -441,10 +513,18 @@ def details_snapshots_table(snaps):
 
 def pvc_row(p):
     cr = p.get("lastChangeRate") or {}
+    from_details = p.get("source") == "restorepointcontent details"
+    cr_tip = ""
     if cr.get("logicalDeltaBytes") is not None:
         cr_txt = signed_bytes(cr.get("logicalDeltaBytes"))
         if cr.get("physicalIngestBytesPerDay") is not None:
             cr_txt += f" · {fmt_bytes(cr['physicalIngestBytesPerDay'])}/day physical"
+    elif from_details:
+        # a bare "–" here reads as "nothing changed"; it means "not measurable from here"
+        cr_txt = "needs the repository"
+        cr_tip = ("the change rate is the delta between two Kopia snapshots, which only the "
+                  "repository holds. It could not be opened, so this is not known - see the "
+                  "banner above this table for why.")
     else:
         cr_txt = "n/a · 1 snapshot" if (p.get("snapshotCount") or 0) < 2 else cr.get("note", "–")
     lm = p.get("lastMaintenance") or {}
@@ -463,9 +543,11 @@ def pvc_row(p):
         + f'<span class="num">{fmt_num(p.get("snapshotCount"))}</span>'
         f'<span class="num">{esc(fmt_bytes(p.get("totalSizeBytes")))}</span>'
         f'<span class="num">{esc(fmt_bytes(p.get("averageFileSizeBytes")))}</span>'
-        f'<span class="muted">{esc(cr_txt)}</span>'
-        f'<span>{status(lm_kind, "ok" if lm_kind == "good" else ("failed" if lm_kind == "bad" else "–"))}</span>'
-        f'</summary>'
+        f'<span class="muted" title="{esc(cr_tip)}">{esc(cr_txt)}</span>'
+        + (f'<span class="muted" title="per-PVC maintenance state comes from the repository, '
+           f'which could not be opened">needs the repository</span>' if from_details else
+           f'<span>{status(lm_kind, "ok" if lm_kind == "good" else ("failed" if lm_kind == "bad" else "–"))}</span>')
+        + '</summary>'
     )
     notes = []
     if not p.get("existsOnCluster"):
@@ -513,7 +595,10 @@ def exports_table(exports):
             exported = (f'<span title="from Kopia pack-blob timestamps; no K10 progress for this export">'
                         f'{fmt_bytes(w["packBytes"])} <span class="muted">· Kopia, {fmt_num(w["packObjects"])} objects</span></span>')
         else:
-            exported = f'<span class="muted" title="{esc(w.get("note") or e.get("detailsError") or "")}">n/a</span>'
+            # w["note"] explains it: contents re-stamped by maintenance, or the repository
+            # never opened. Either way this is "not known", never a zero.
+            exported = (f'<span class="muted" title="{esc(w.get("note") or e.get("detailsError") or "")}">'
+                        f'unknown</span>')
         if src.get("logicalBytes"):
             n = len(src.get("pvcs") or [])
             source = f'{fmt_bytes(src["logicalBytes"])} <span class="muted">· {n} PVC{"s" if n != 1 else ""}</span>'
@@ -568,14 +653,27 @@ def namespace_block(ns):
     aps_html = ('<div class="note">ActionPodSpecs: none bound to this namespace — datamovers run with '
                 'the defaults (no resource requests or limits).</div>' if not aps else
                 '<div class="note">ActionPodSpecs: ' + ", ".join(f'<code>{esc(a.get("actionPodSpec"))}</code>' for a in aps) + '</div>')
-    hdr = ('<div class="hdr"><span>PVC</span><span>Workload</span><span class="num">Files</span><span class="num">Snaps</span>'
+    # "Snaps" was read as "Kopia clones that should have been cleaned up after the export".
+    # They are the restore points themselves and are meant to persist until retention
+    # expires; the transient clone the datamover reads is a different object and is deleted
+    # with the export. Spell it out in the header and the tooltip.
+    hdr = ('<div class="hdr"><span>PVC</span><span>Workload</span><span class="num">Files</span>'
+           '<span class="num" title="Kopia snapshots of this PVC held in the export repository, '
+           'i.e. its restore points. They persist until K10 retention expires them - they are not '
+           'the temporary clone the datamover reads, which is deleted when the export finishes.">'
+           'Restore points</span>'
            '<span class="num">Logical size</span><span class="num">Avg file</span><span>Last change</span><span>Maintenance</span></div>')
     restamp = repo.get("contentsRestampedAt")
     restamp_note = (f'<div class="note">Contents re-stamped by full maintenance at {esc(fmt_ts(restamp))}: '
                     f'physical ingest of snapshots before that is not recoverable.</div>' if restamp else "")
+    created = ns.get("createdAt") or (orphan or {}).get("namespaceCreatedAt")
+    csrc = ns.get("createdAtSource") or (orphan or {}).get("namespaceCreatedAtSource") or ""
+    created_txt = (f' · created {esc(fmt_ts(created))}' if created else "")
     return (
-        f'<div class="card"><h3>Namespace <code>{esc(ns["name"])}</code> '
-        f'<span class="sub">— {fmt_num(ns.get("pvcCount"))} PVCs · {fmt_num(ns.get("totalFileCount"))} files · {esc(fmt_bytes(ns.get("totalSizeBytes")))}</span></h3>'
+        f'<div class="card" id="{esc(ns_anchor(ns))}"><h3>Namespace <code>{esc(ns["name"])}</code> '
+        f'<span class="sub">— {fmt_num(ns.get("pvcCount"))} PVCs · {fmt_num(ns.get("totalFileCount"))} files · '
+        f'{esc(fmt_bytes(ns.get("totalSizeBytes")))}'
+        f'<span title="{esc(csrc)}">{created_txt}</span></span></h3>'
         f'<div class="chips">{"".join(chips)}</div>'
         f'{orphan_banner(orphan)}'
         + ("" if repo.get("openable") is False else
@@ -741,17 +839,31 @@ def render(t, banner=None):
     pvcs = [pv for n in nss for pv in n.get("pvcs") or []]
     snaps = sum(len(pv.get("snapshots") or []) for pv in pvcs)
     total_logical = sum(pv.get("totalSizeBytes") or 0 for pv in pvcs)
-    total_objects = sum((n.get("repository") or {}).get("objectCount") or 0 for n in nss)
-    total_stored = sum((n.get("repository") or {}).get("objectBytes") or 0 for n in nss)
+    # Only namespaces whose repository was actually read can contribute an object count.
+    # Summing `or 0` over the rest reported a confident "0 objects · 0 B stored" for a
+    # cluster whose repositories had simply never been opened.
+    counted = [n for n in nss if (n.get("repository") or {}).get("objectCount") is not None]
+    unread = len(nss) - len(counted)
+    total_objects = sum((n.get("repository") or {}).get("objectCount") or 0 for n in counted)
+    total_stored = sum((n.get("repository") or {}).get("objectBytes") or 0 for n in counted)
     met = t.get("metrics") or {}
     cl = t.get("cluster") or {}
     kpis = [
         tile("Policies with exports", len(pols)),
         tile("Namespace/profile pairs", len(nss)),
         tile("PVCs in repositories", len(pvcs)),
-        tile("Snapshots", snaps),
+        # "Snapshots" alone was read as the Kasten dashboard's local-snapshot count, which is
+        # a different thing: that one counts local CSI snapshots, this one counts Kopia
+        # snapshots inside the export repositories, summed over every PVC.
+        tile("Kopia snapshots", snaps, "restore points in the export repositories, over all PVCs"),
         tile("Logical size (last snapshots)", fmt_bytes(total_logical)),
-        tile("Objects on object stores", fmt_num(total_objects), fmt_bytes(total_stored) + " stored"),
+        (tile("Objects on object stores", fmt_num(total_objects),
+              fmt_bytes(total_stored) + " stored"
+              + (f" · {unread} repositories not read" if unread else ""))
+         if counted else
+         tile("Objects on object stores", "not read",
+              f"{unread} repositor{'y' if unread == 1 else 'ies'} could not be opened"
+              if unread else "no repository was inventoried")),
         tile("Datamover metrics",
              ("available" if met.get("podLabelsExposed") is not False else "unattributed") if met.get("available") else "unavailable",
              (f'{(met.get("retentionSeconds") or 0)//86400} d retention' +
@@ -799,15 +911,32 @@ def render(t, banner=None):
                       'in the banner. In all three cases '
                       '<code>restorepointcontents/&lt;name&gt;/details</code> is cluster-scoped and survives, so the '
                       'PVCs, Kopia snapshot ids and sizes below come from there.</div>'
-                      + table(["Namespace", "Policy", "Profile", "Gone", "Restore points", "Frozen since",
-                               "K10 last worked on it"],
-                              [[esc(x.get("namespace")), f'<code>{esc(x.get("policy"))}</code>', esc(x.get("profile")),
+                      + table(["Namespace",
+                               ("Namespace created",
+                                "when the namespace was created. For a deleted one this comes from "
+                                "the namespace manifest captured inside the restore point, so it "
+                                "survives the namespace itself - read it next to Frozen since to get "
+                                "how long this data was being written."),
+                               "Policy", "Profile", "Gone", "Restore points", "Frozen since",
+                               ("K10 last worked on it",
+                                "the last procedure K10 itself ran against this repository, from "
+                                "StorageRepository status.processResults. MaintenanceRun is Kopia "
+                                "maintenance (compaction and expiry); StorageScan is K10 "
+                                "recomputing the repository's storage usage, which is what feeds "
+                                "the Data Usage figures in the Kasten dashboard. A recent date here "
+                                "means K10 can still open the repository even though repo_checker "
+                                "cannot.")],
+                              [[esc(x.get("namespace")),
+                                (f'<span title="{esc(x.get("namespaceCreatedAtSource") or "")}">'
+                                 f'{esc(fmt_ts(x.get("namespaceCreatedAt")))}</span>'
+                                 if x.get("namespaceCreatedAt") else '<span class="muted">–</span>'),
+                                f'<code>{esc(x.get("policy"))}</code>', esc(x.get("profile")),
                                 esc(" + ".join(x.get("orphanedBy") or [])),
                                 fmt_num(x.get("restorePoints")), esc(fmt_ts(x.get("frozenSince"))),
                                 (lambda c: (f'{esc(fmt_ts(c.get("lastProcessedAt")))} '
                                             f'<span class="muted">{esc(c.get("lastProcedure") or "")}</span>')
                                  if c.get("lastProcessedAt") else '<span class="muted">–</span>')(x.get("storageRepository") or {})]
-                               for x in uo], num_cols=(4,))
+                               for x in uo], num_cols=(5,))
                       + '</details>')
     pf = t.get("profilesFailingValidation") or []
     if pf:
@@ -890,7 +1019,8 @@ def render(t, banner=None):
         + f'<div class="kpis">{"".join(kpis)}</div>'
         f'<div class="note">Only namespaces with volume data in a Kopia repository appear. Datamover CPU/memory is the sum over '
         f'all datamover pods alive in each window — attributed to namespace and job via kube-state-metrics pod labels, not to a PVC.</div>'
-        f'{warn_html}{nodes_block(t.get("nodes"))}{limiters_block(t.get("helmLimiters"))}'
+        + highlights_block(nss)
+        + f'{warn_html}{nodes_block(t.get("nodes"))}{limiters_block(t.get("helmLimiters"))}'
         + "".join(policy_card(p) for p in pols)
         + extra_html
         + f'<footer>Rendered from export-topology.json · {esc(fmt_ts(t.get("generatedAt")))}</footer>'

@@ -667,12 +667,15 @@ CONNECT_DIAGNOSES = [
     (("x509", "certificate signed by unknown authority", "failed to verify certificate",
       "certificate is valid for", "tls: "),
      "the object store's TLS certificate is not trusted inside the pod",
-     "set skipSSLVerify on the Location Profile: repo_checker does honour it - measured on a "
-     "self-signed endpoint, it passes the flag through to kopia and the connect then "
-     "succeeds, while with skipSSLVerify false the same repository will not open although "
-     "K10's own exports to it keep working. Adding the CA to the pod's trust store is the "
-     "alternative, but repo_checker builds that pod itself and gives it neither the "
-     "profile's CA nor the cluster trust bundle."),
+     "repo_checker builds its pod itself and gives it neither the profile's CA nor the "
+     "cluster trust bundle, so K10's own exports keep working while this fails. "
+     "skipSSLVerify on the Location Profile is honoured (measured on a self-signed endpoint) "
+     "but only when the profile already carried it when the repository was written: turned "
+     "on afterwards, the profile no longer matches the location recorded with the "
+     "repository and the connect fails with 'failed to find a profile with given location "
+     "information' instead (seen on a customer cluster). Do not flip it on an existing "
+     "profile; the fix belongs in repo_checker, and meanwhile the repository is described "
+     "from /details."),
     (("no such host", "server misbehaving", "dns"),
      "the object store endpoint does not resolve from inside the pod",
      "the endpoint in the Location Profile may be resolvable from K10's pods but not from this "
@@ -956,6 +959,12 @@ def restore_points_from_details(kube, names, max_n=40, live_pvcs=None):
 
     Returns per-PVC rows shaped like the Kopia-derived ones so the report reads the same."""
     by_pvc = {}
+    # The namespace object is captured in the restore point as an artifact of its own, so its
+    # creation date survives the namespace itself: artifacts[] where source.kind == "namespace"
+    # carries meta.spec.config, a JSON *string* holding the manifest. Its metadata.uid is also
+    # the last segment of the repository path, which is how that path can be tied back to a
+    # namespace that no longer exists. Verified against a live payload 2026-10-06.
+    nsmeta = {}
     fetched = errors = 0
     for n in names[:max_n]:
         r = kube.run("get", "--raw",
@@ -971,6 +980,15 @@ def restore_points_from_details(kube, names, max_n=40, live_pvcs=None):
             continue
         fetched += 1
         for a in (((d.get("status") or {}).get("restorePointContentDetails") or {}).get("artifacts") or []):
+            if ((a.get("source") or {}).get("kind") or "").lower() == "namespace" and not nsmeta:
+                cfg = ((a.get("meta") or {}).get("spec") or {}).get("config")
+                try:
+                    md = ((json.loads(cfg) or {}).get("metadata") or {}) if cfg else {}
+                except ValueError:
+                    md = {}
+                if md.get("creationTimestamp") or md.get("uid"):
+                    nsmeta = {"createdAt": md.get("creationTimestamp"), "uid": md.get("uid"),
+                              "source": "namespace manifest captured in the restore point"}
             kan = ((a.get("meta") or {}).get("kanister") or {})
             vol = ((kan.get("meta") or {}).get("k8sVolume") or {})
             pvc = vol.get("pvcName")
@@ -1013,8 +1031,8 @@ def restore_points_from_details(kube, names, max_n=40, live_pvcs=None):
                                                              "described from restore point details"}})
         out.append(e)
     out.sort(key=lambda x: x["name"])
-    return out, {"restorePointsRead": fetched, "restorePointsFailed": errors,
-                 "restorePointsAvailable": len(names)}
+    return out, nsmeta, {"restorePointsRead": fetched, "restorePointsFailed": errors,
+                         "restorePointsAvailable": len(names)}
 
 
 # --------------------------------------------------------------------------- repo_checker
@@ -1727,6 +1745,10 @@ def collect(args):
     # 1. the export policies (the scope rule; never depends on repo_checker)
     excluded = {x.strip() for x in (k10cfg.get("excludedApps") or "").split(",") if x.strip()}
     all_ns = (kube.get("namespaces") or {"items": []})["items"]
+    # how long the namespace has existed, next to how long it has been exported - a frozen
+    # namespace whose repository still holds 35 restore points is a different story depending
+    # on whether it lived for a day or a year
+    ns_created = {n["metadata"]["name"]: n["metadata"].get("creationTimestamp") for n in all_ns}
     targets = {}
     for (ns, prof), pols in policy_targets(policies, all_ns, excluded).items():
         if args.namespace and ns not in args.namespace:
@@ -1891,10 +1913,20 @@ def collect(args):
         """Fill in everything that does not need the repository to be opened: the PVCs and
         restore points from /details, and the datamover runs from Prometheus (those pods ran
         in the K10 namespace, so they survive whatever is wrong with the repository)."""
-        pvcs, stats = restore_points_from_details(kube, info.get("names") or [],
-                                                  live_pvcs=set(pvc_by_ns.get(ns, {})))
+        pvcs, nsmeta, stats = restore_points_from_details(
+            kube, info.get("names") or [], live_pvcs=set(pvc_by_ns.get(ns, {})))
         info.update(pvcs=pvcs, detailStats=stats, openable=False, cannotOpenBecause=why,
                     describedFrom="restorepointcontents/<name>/details")
+        # a live namespace knows its own age; a deleted one is dated from the restore point
+        live_created = ns_created.get(ns)
+        if live_created:
+            info["namespaceCreatedAt"] = live_created
+            info["namespaceCreatedAtSource"] = "live namespace on the cluster"
+        elif nsmeta.get("createdAt"):
+            info["namespaceCreatedAt"] = nsmeta["createdAt"]
+            info["namespaceCreatedAtSource"] = nsmeta.get("source")
+        if nsmeta.get("uid"):
+            info["namespaceUid"] = nsmeta["uid"]
         if prom and prom.available and prom.retention_seconds:
             now = time.time()
             info["datamover"] = datamover_runs_for_namespace(
@@ -2033,7 +2065,7 @@ def collect(args):
     return _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
                      export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir,
                      nodes_info, [{'namespace': k[0], 'profile': k[1], **{x: y for x, y in v[0].items() if x != 'names'}}
-                                  for k, v in sorted(unopenable.items())])
+                                  for k, v in sorted(unopenable.items())], ns_created)
 
 
 def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
@@ -2341,7 +2373,7 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
 
 def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles, apspecs, bindings,
               export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir,
-              nodes_info=None, unopenable_pairs=None):
+              nodes_info=None, unopenable_pairs=None, ns_created=None):
     # ---- export actions -----------------------------------------------------------------
     # One policy run (label runActionName) produces a metadata export in the K10 namespace
     # (isMetadataExport=true, no progress) and one export per application in that
@@ -2453,7 +2485,15 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                 src_bytes = sum(x["logicalBytes"] for x in in_win)
                 ex["source"] = {"pvcs": sorted({x["pvc"] for x in in_win}), "logicalBytes": src_bytes,
                                 "note": "logical size of every PVC snapshot taken by this export, from Kopia"}
-                if res["_rewrite_ts"] and epoch(e_) < res["_rewrite_ts"]:
+                # An unopened repository has empty _blobs/_contents, and written_in_window then
+                # returns (0, 0) - which the report printed as "0 B, 0 objects", a measurement
+                # it never made, next to a change rate that correctly said "unknown". Say
+                # nothing rather than zero.
+                opened = (res.get("repository") or {}).get("openable") is not False
+                if not opened:
+                    ex["written"] = {"note": "the repository could not be opened, so what reached the "
+                                             "object store during this export is not known - unknown, not zero"}
+                elif res["_rewrite_ts"] and epoch(e_) < res["_rewrite_ts"]:
                     ex["written"] = {"note": "unrecoverable: repository contents re-stamped by maintenance since this export"}
                 else:
                     is_pack = lambda b: b.get("id", "")[:1] in ("p", "q")
@@ -2466,10 +2506,8 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                 # against earlier snapshots and compression pull it down, encryption adds a little.
                 # Numerator: K10's own transferredBytes when /details gave it, else Kopia's pack bytes.
                 num, basis = ex.get("exportedBytes"), "k10 transferredBytes"
-                # Only fall back to Kopia pack bytes if the repository was actually read.
-                # Unopened, written_in_window sees no blobs and returns 0, which rendered as
-                # a change rate of 0.0 - "nothing changed" - instead of "not known".
-                opened = (res.get("repository") or {}).get("openable") is not False
+                # Only fall back to Kopia pack bytes if the repository was actually read
+                # (`opened`, set above) - otherwise the numerator is not known.
                 if num is None and opened and "packBytes" in (ex.get("written") or {}):
                     num, basis = ex["written"]["packBytes"], "kopia pack bytes written in the window"
                 elif num is None and not opened:
@@ -2537,6 +2575,9 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                                                   "or a run-now action into the same repository, or the action history was retired")
             pol_out[pol_name]["namespaces"].append({
                 "name": ns,
+                "createdAt": (ns_created or {}).get(ns),
+                "createdAtSource": ("live namespace on the cluster"
+                                    if (ns_created or {}).get(ns) else None),
                 "orphan": res.get("orphan"),
                 "actionPodSpecs": aps_for_namespace(ns),
                 "repository": res["repository"],
