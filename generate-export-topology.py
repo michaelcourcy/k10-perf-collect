@@ -1647,8 +1647,23 @@ def collect(args):
     # The StorageRepository CR names every repository and gives its location. Attach it to
     # every pair, live or orphaned: when repo_checker's inventory aborts, this is what keeps
     # the repository name in the report instead of a blank.
+    # Every target carries the StorageRepository CR and whatever the exported history says
+    # about it. The history is the authoritative answer to "did this pair ever export", and
+    # a connect failure is classified against it rather than against the error text.
+    hist_by_pair = {}
+    for (ns_, pol_, prof_), info_ in hist_triples.items():
+        h = hist_by_pair.setdefault((ns_, prof_), {"restorePoints": 0, "names": [],
+                                                   "policies": set(), "newest": None, "oldest": None})
+        h["restorePoints"] += info_["restorePoints"]
+        h["names"] += info_["names"]
+        if pol_ != "-":
+            h["policies"].add(pol_)
+        for key, pick in (("newest", max), ("oldest", min)):
+            if info_.get(key):
+                h[key] = pick(h[key] or info_[key], info_[key])
     for k, v in targets.items():
         v["cr"] = hist_repos.get(k)
+        v["hist"] = hist_by_pair.get(k)
     if orphan_pairs:
         n_gone = sum(1 for i in orphan_pairs.values() if i["orphanedBy"])
         n_off = len(orphan_pairs) - n_gone
@@ -1700,20 +1715,24 @@ def collect(args):
                        "password are gone - this one really is unreadable")
         if why:
             unopenable[k] = (targets.pop(k)["orphan"], why)
+    def describe_unopenable(ns, prof, info, why):
+        """Fill in everything that does not need the repository to be opened: the PVCs and
+        restore points from /details, and the datamover runs from Prometheus (those pods ran
+        in the K10 namespace, so they survive whatever is wrong with the repository)."""
+        pvcs, stats = restore_points_from_details(kube, info.get("names") or [])
+        info.update(pvcs=pvcs, detailStats=stats, openable=False, cannotOpenBecause=why,
+                    describedFrom="restorepointcontents/<name>/details")
+        if prom and prom.available and prom.retention_seconds:
+            now = time.time()
+            info["datamover"] = datamover_runs_for_namespace(
+                prom, kube.k10ns, args.datamover_pod_regex, ns,
+                now - prom.retention_seconds, now)
+        return info
+
     if unopenable:
         with Step(f"restore point details for {len(unopenable)} unopenable pairs", indent=2) as st:
             for (ns, prof), (info, why) in sorted(unopenable.items()):
-                pvcs, stats = restore_points_from_details(kube, info["names"])
-                info.update(pvcs=pvcs, detailStats=stats, openable=False,
-                            cannotOpenBecause=why,
-                            describedFrom="restorepointcontents/<name>/details")
-                # the namespace is gone but its datamover pods ran in the K10 namespace,
-                # so cAdvisor and kube-state-metrics still have them
-                if prom and prom.available and prom.retention_seconds:
-                    now = time.time()
-                    info["datamover"] = datamover_runs_for_namespace(
-                        prom, kube.k10ns, args.datamover_pod_regex, ns,
-                        now - prom.retention_seconds, now)
+                describe_unopenable(ns, prof, info, why)
             st.note = f"{sum(len(i[0].get('pvcs') or []) for i in unopenable.values())} PVCs described"
 
     # ---- repo_checker: ENRICHMENT ONLY, after the scope is already settled ------------------
@@ -1791,10 +1810,43 @@ def collect(args):
             "_snapshot_times": [], "_snapshot_index": []}
 
     # ---- per (namespace, profile): connect and read Kopia -----------------------------------
+    cannot_open = []
     try:
-        _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported)
+        _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
+                           cannot_open)
     finally:
         rc.cleanup(wait=True)
+
+    # Pairs whose repository exists (the history proves it) but could not be opened. The
+    # cause chain is reported verbatim - a trust-store or credential problem is actionable,
+    # "never exported there" is not.
+    if cannot_open:
+        with Step(f"restore point details for {len(cannot_open)} pairs that would not open", indent=2) as st:
+            for ns, prof, hist, cause in cannot_open:
+                info = dict(hist, policy=(sorted(hist.get("policies") or []) or ["-"])[0],
+                            policies=sorted(hist.get("policies") or []),
+                            orphanedBy=[], profileExistsOnCluster=prof in profiles,
+                            storageRepository=hist_repos.get((ns, prof)),
+                            connectError=cause,
+                            note=("the repository exists - %d restore points were exported here - "
+                                  "but repo_checker could not open it, so the figures below come "
+                                  "from the restore point details instead of from Kopia"
+                                  % hist.get("restorePoints", 0)))
+                describe_unopenable(ns, prof, info, [f"repo_checker could not open it: {cause}"])
+                unopenable[(ns, prof)] = (info, info["cannotOpenBecause"])
+                cr = hist_repos.get((ns, prof)) or {}
+                ns_results[(ns, prof)] = {
+                    "repository": {"name": cr.get("repository"), "nameFrom": "StorageRepository CR",
+                                   "profile": prof, "inventoried": False, "openable": False,
+                                   "location": {"type": cr.get("objectStoreType"),
+                                                "bucket": cr.get("bucket"), "prefix": cr.get("path")},
+                                   "note": "described from restore point details; the repository "
+                                           "could not be opened"},
+                    "pvcs": info.get("pvcs") or [], "policies": set(info["policies"]),
+                    "orphan": info, "_blobs": [], "_contents": [], "_rewrite_ts": None,
+                    "_snapshot_times": [], "_snapshot_index": []}
+            st.note = (f"{len(cannot_open)} pairs, "
+                       f"{sum(len(unopenable[(n, pr)][0].get('pvcs') or []) for n, pr, _, _ in cannot_open)} PVCs described")
     # ExportActions are listed only now: the repositories were read over the last minutes
     # and an export that started meanwhile has its Kopia snapshot in them - listing the
     # actions first left such a snapshot without its action (seen: 4 snapshots, 3 actions).
@@ -1807,7 +1859,8 @@ def collect(args):
                                   for k, v in sorted(unopenable.items())])
 
 
-def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported):
+def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
+                       cannot_open):
     total = len(targets)
     for i, ((ns, prof), t) in enumerate(sorted(targets.items()), 1):
         log(f"[{i}/{total}] connecting to repository of {ns} on profile {prof} ...")
@@ -1815,12 +1868,23 @@ def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not
             pod = rc.connect(ns, prof)
         except ConnectError as e:
             cause = str(e)
-            if "failed to connect to repository" in cause:
-                log(f"  {ns}/{prof}: no repository on this profile ({cause.split(' -> ')[-1]}) - never exported there")
+            hist = t.get("hist")
+            if hist and hist.get("restorePoints"):
+                # It HAS exported here - the restore point history says so - therefore the
+                # connect failed on something other than absence. Seen on a customer cluster:
+                # an internal CA, "tls: failed to verify certificate: x509: certificate
+                # signed by unknown authority" against the S3 endpoint, while K10's own pods
+                # (which get the trust bundle) exported successfully every night. Calling
+                # that "never exported there" threw away a readable namespace, so it is now
+                # described from the restore point details instead.
+                log(f"  {ns}/{prof}: {hist['restorePoints']} restore points exported here, but the "
+                    f"repository cannot be opened - describing it from the restore point details")
+                cannot_open.append((ns, prof, hist, cause))
+            else:
+                log(f"  {ns}/{prof}: no repository on this profile ({cause.split(' -> ')[-1]}) "
+                    f"and no exported restore point in the history - never exported there")
                 not_exported.append({"namespace": ns, "profile": prof, "policies": sorted(t["policies"]),
                                      "reason": cause})
-            else:
-                warn(f"{ns}/{prof}: connect failed: {cause}")
             continue
         except Exception as e:  # noqa: BLE001
             warn(f"{ns}/{prof}: {e}")
