@@ -723,6 +723,23 @@ def diagnose_connect_failure(chain, profile=None):
         if any(n in blob for n in needles):
             out["diagnosis"], out["hint"] = what, hint
             break
+    return _profile_diagnosis(out, validation, pchain)
+
+
+def skipped_diagnosis(profile=None):
+    """The --skip-repo-checker counterpart of diagnose_connect_failure: same keys, so the
+    pair takes the same path through the report as one whose connect failed. The profile's
+    own validation is still reported - it needs no repo_checker and often explains why
+    the flag was used."""
+    validation, pchain = profile_status(profile)
+    out = {"diagnosis": "repo_checker was not run (--skip-repo-checker)",
+           "hint": "the repository was not opened by choice; rerun without --skip-repo-checker "
+                   "for object counts, dedup ratio, maintenance and the file-size histogram.",
+           "innermostCause": None, "repoCheckerSkipped": True}
+    return _profile_diagnosis(out, validation, pchain)
+
+
+def _profile_diagnosis(out, validation, pchain):
     if validation is not None and validation != "Success":
         out["profileValidation"] = validation
         out["profileValidationCause"] = pchain[-1] if pchain else None
@@ -1954,12 +1971,19 @@ def collect(args):
         origin = "the registry K10 pulls from" if detected else "repo_checker default, K10's registry not readable from k10-config"
     else:
         registry, origin = args.image_registry, "--image-registry"
-    rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
-    rc.detected_registry = detected
-    log(f"repo_checker images: {registry}/k10tools:{args.image_tag or ver}  ({origin})")
+    if args.skip_repo_checker:
+        # no download, no pod: every pair is described from the restore point details, by
+        # the same path a failed connect takes (see cannot_open below)
+        rc = None
+        log("repo_checker skipped (--skip-repo-checker): no inventory, no connect; every pair "
+            "is described from the restore point details")
+    else:
+        rc = RepoChecker(kube, args.repo_checker, ver, workdir, keep_pods=args.keep_pods, image_registry=registry, image_tag=args.image_tag or ver)
+        rc.detected_registry = detected
+        log(f"repo_checker images: {registry}/k10tools:{args.image_tag or ver}  ({origin})")
 
     inv, orphan_repos = {"repositories": []}, []
-    if not args.no_inventory:
+    if rc and not args.no_inventory:
         log("repo_checker inventory (enrichment; scope is already known) ...")
         # the repositories of each profile, from the StorageRepository CRs, so that a profile
         # whose inventory aborts can still be listed one repository at a time
@@ -2016,17 +2040,23 @@ def collect(args):
 
     # ---- per (namespace, profile): connect and read Kopia -----------------------------------
     cannot_open = []
-    try:
-        _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
-                           cannot_open, profiles)
-    finally:
-        rc.cleanup(wait=True)
+    if rc is None:
+        _skip_repositories(targets, not_exported, cannot_open, profiles)
+    else:
+        try:
+            _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
+                               cannot_open, profiles)
+        finally:
+            rc.cleanup(wait=True)
 
     # Pairs whose repository exists (the history proves it) but could not be opened. The
     # cause chain is reported verbatim - a trust-store or credential problem is actionable,
     # "never exported there" is not.
+    # cause None = repo_checker was skipped; everything else is identical, so a skipped pair
+    # and a failed one produce the same JSON shape and the same report.
     if cannot_open:
-        with Step(f"restore point details for {len(cannot_open)} pairs that would not open", indent=2) as st:
+        label = "pairs not opened" if rc is None else "pairs that would not open"
+        with Step(f"restore point details for {len(cannot_open)} {label}", indent=2) as st:
             for ns, prof, hist, cause in cannot_open:
                 info = dict(hist, policy=(sorted(hist.get("policies") or []) or ["-"])[0],
                             policies=sorted(hist.get("policies") or []),
@@ -2034,11 +2064,14 @@ def collect(args):
                             storageRepository=hist_repos.get((ns, prof)),
                             connectError=cause,
                             note=("the repository exists - %d restore points were exported here - "
-                                  "but repo_checker could not open it, so the figures below come "
-                                  "from the restore point details instead of from Kopia"
-                                  % hist.get("restorePoints", 0)))
-                diag = diagnose_connect_failure([c for c in cause.split(" -> ") if c],
-                                                 profiles.get(prof))
+                                  "but %s, so the figures below come from the restore point "
+                                  "details instead of from Kopia"
+                                  % (hist.get("restorePoints", 0),
+                                     "repo_checker was skipped" if cause is None
+                                     else "repo_checker could not open it")))
+                diag = (skipped_diagnosis(profiles.get(prof)) if cause is None else
+                        diagnose_connect_failure([c for c in cause.split(" -> ") if c],
+                                                 profiles.get(prof)))
                 info.update(diag)
                 describe_unopenable(ns, prof, info,
                                     [diag["diagnosis"]] + ([diag["hint"]] if diag.get("hint") else []))
@@ -2054,6 +2087,9 @@ def collect(args):
                     "pvcs": info.get("pvcs") or [], "policies": set(info["policies"]),
                     "orphan": info, "_blobs": [], "_contents": [], "_rewrite_ts": None,
                     "_snapshot_times": [], "_snapshot_index": details_snapshot_index(info.get("pvcs"))}
+                if cause is None:
+                    ns_results[(ns, prof)]["repository"]["note"] = (
+                        "described from restore point details; repo_checker was skipped")
             st.note = (f"{len(cannot_open)} pairs, "
                        f"{sum(len(unopenable[(n, pr)][0].get('pvcs') or []) for n, pr, _, _ in cannot_open)} PVCs described")
     # ExportActions are listed only now: the repositories were read over the last minutes
@@ -2066,6 +2102,27 @@ def collect(args):
                      export_actions, prom, inv, orphan_repos, ns_results, not_exported, skipped_no_rp, workdir,
                      nodes_info, [{'namespace': k[0], 'profile': k[1], **{x: y for x, y in v[0].items() if x != 'names'}}
                                   for k, v in sorted(unopenable.items())], ns_created)
+
+
+def _skip_repositories(targets, not_exported, cannot_open, profiles=None):
+    """--skip-repo-checker: classify every pair exactly as _read_repositories classifies a
+    failed connect - restore points in the history means describe it from /details, none
+    means never exported there - without starting a pod."""
+    for (ns, prof), t in sorted(targets.items()):
+        hist = t.get("hist")
+        if hist and hist.get("restorePoints"):
+            log(f"  {ns}/{prof}: {hist['restorePoints']} restore points exported here; "
+                f"repo_checker skipped, describing it from the restore point details")
+            d = skipped_diagnosis((profiles or {}).get(prof))
+            if d.get("profileValidation"):
+                log(f"      profile {prof} validation: {d['profileValidation']}")
+                if d.get("profileValidationCause"):
+                    log(f"      profile cause: {d['profileValidationCause'][:220]}")
+            cannot_open.append((ns, prof, hist, None))
+        else:
+            not_exported.append({"namespace": ns, "profile": prof, "policies": sorted(t["policies"]),
+                                 "reason": "no exported restore point in the history (repo_checker "
+                                           "skipped, repository not checked)"})
 
 
 def _read_repositories(args, kube, rc, prom, targets, pvc_by_ns, ns_results, not_exported,
@@ -2617,6 +2674,8 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
         # resolves the repository from its UID) or the profile is gone (no credentials).
         # Described from restorepointcontents/<name>/details instead.
         "unopenableRepositories": unopenable_pairs or [],
+        "repoChecker": {"skipped": bool(args.skip_repo_checker),
+                        "inventory": not (args.skip_repo_checker or args.no_inventory)},
         "filter": ({"namespaces": args.namespace, "policies": args.policy} if (args.namespace or args.policy) else None),
         "notExported": not_exported,
         "scopeNotes": {"namespacesWithoutRestorePointSkipped": skipped_no_rp,
@@ -2658,6 +2717,10 @@ def main():
     ap.add_argument("--no-histogram", action="store_true", help="skip the file-size histogram (a full tree listing per PVC)")
     ap.add_argument("--histogram-max-files", type=int, default=2_000_000, help="skip the histogram above this many files")
     ap.add_argument("--no-content-list", action="store_true", help="skip kopia content list (no physical ingest figures)")
+    ap.add_argument("--skip-repo-checker", action="store_true",
+                    help="do not download or run repo_checker at all (no inventory, no connect, no "
+                         "debug pods). Every pair is described from the restore point details, as "
+                         "when a connect fails; helm is not needed")
     ap.add_argument("--no-inventory", action="store_true", help="skip repo_checker inventory entirely; scope does not depend on it")
     ap.add_argument("--inventory-per-repository", action="store_true",
                     help="when a profile's inventory aborts, retry it one repository at a time "
@@ -2670,7 +2733,7 @@ def main():
     global VERBOSE
     VERBOSE = args.verbose
 
-    for tool in ("kubectl", "helm"):
+    for tool in ("kubectl",) + (() if args.skip_repo_checker else ("helm",)):
         if not shutil.which(tool):
             raise SystemExit(f"{tool} not found in PATH ({'repo_checker requires helm' if tool == 'helm' else 'required'})")
 

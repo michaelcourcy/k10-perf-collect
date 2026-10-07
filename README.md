@@ -89,7 +89,10 @@ down the same way: `python3 render-export-topology.py topo.json --policy POLICY 
 (a banner says what was hidden).
 
 Useful flags: `--namespace NS` (repeatable) to restrict; `--no-inventory` to skip
-`repo_checker` inventory entirely (policies only); `--no-histogram` to skip the
+`repo_checker` inventory entirely (policies only); `--skip-repo-checker` to not download
+or run `repo_checker` at all (no pods, no helm needed) when it is known to fail or its
+Kopia detail is not wanted — every pair is then described from the restore point details,
+exactly as when a connect fails; `--no-histogram` to skip the
 per-PVC tree listing; `--prom-url` / `--prom-token` for a non-OpenShift Prometheus;
 `--no-metrics` to skip cAdvisor entirely. `./generate-export-topology.sh` is a thin
 wrapper. `--help` lists everything.

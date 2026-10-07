@@ -385,8 +385,10 @@ def unopenable_detail(o):
     if o.get("openable") is not False:
         return ""
     out = ""
+    skipped = o.get("repoCheckerSkipped")
     if o.get("diagnosis"):
-        out += f'<br><b>Why it would not open:</b> {esc(o["diagnosis"])}.'
+        out += (f'<br><b>{"Why it was not opened" if skipped else "Why it would not open"}:</b> '
+                f'{esc(o["diagnosis"])}.')
         if o.get("innermostCause"):
             out += (f'<br><span class="muted"><b>Innermost cause:</b> '
                     f'<code>{esc((o.get("innermostCause") or "")[:400])}</code></span>')
@@ -414,7 +416,9 @@ def unopenable_detail(o):
                 f'{esc(fmt_ts(cr.get("lastProcessedAt")))}'
                 + (" successfully" if cr.get("lastProcedureSucceeded") else "")
                 + f' ({fmt_num(cr.get("processCount"))} operations in total), so K10 opens and '
-                  'maintains it. What is missing is a way for repo_checker to reach it.</span>')
+                  'maintains it.'
+                + ('' if skipped else ' What is missing is a way for repo_checker to reach it.')
+                + '</span>')
     return out
 
 
@@ -440,11 +444,13 @@ def orphan_banner(o):
                 f'history, not a current state, and the data still occupies the object '
                 f'store.{detail}</div>')
     if o.get("openable") is False:
-        return (f'<div {box}><b>The repository could not be opened.</b> This namespace exported '
+        skipped = o.get("repoCheckerSkipped")
+        return (f'<div {box}><b>The repository {"was not opened" if skipped else "could not be opened"}.</b> '
+                f'This namespace exported '
                 f'{fmt_num(o.get("restorePoints"))} restore points here under policy '
                 f'<code>{esc(o.get("policy"))}</code>, most recently '
                 f'{esc(fmt_ts(o.get("newest")))}{read} — so the data is there and the exports are '
-                f'working. Only this tool could not read it.{detail}</div>')
+                f'working.{"" if skipped else " Only this tool could not read it."}{detail}</div>')
     return (f'<div {box}><b>Not on the policy\'s current profile.</b> This namespace exported '
             f'{fmt_num(o.get("restorePoints"))} restore points here under policy '
             f'<code>{esc(o.get("policy"))}</code>, most recently {esc(fmt_ts(o.get("newest")))}, '
@@ -862,6 +868,7 @@ def render(t, banner=None):
               + (f" · {unread} repositories not read" if unread else ""))
          if counted else
          tile("Objects on object stores", "not read",
+              "repo_checker skipped" if (t.get("repoChecker") or {}).get("skipped") else
               f"{unread} repositor{'y' if unread == 1 else 'ies'} could not be opened"
               if unread else "no repository was inventoried")),
         tile("Datamover metrics",
@@ -894,10 +901,17 @@ def render(t, banner=None):
                       + '</details>')
     uo = t.get("unopenableRepositories") or []
     if uo:
-        warn_html += ('<details class="card warn-box" open><summary><b>Exported data that can no longer be opened</b> '
+        title = ("Exported data described without opening the repository"
+                 if (t.get("repoChecker") or {}).get("skipped") else
+                 "Exported data that can no longer be opened")
+        warn_html += (f'<details class="card warn-box" open><summary><b>{title}</b> '
                       f'<span class="sub">{len(uo)} — described from the restore point details; '
                       'the data is still on the object store</span></summary>'
-                      '<div class="note">Three different situations end up here, and the per-namespace '
+                      + ('<div class="note"><b>repo_checker was skipped for this run</b> '
+                         '(<code>--skip-repo-checker</code>), so every repository is described here '
+                         'from the restore point details, whether or not it could have been '
+                         'opened.</div>' if (t.get("repoChecker") or {}).get("skipped") else '')
+                      + '<div class="note">Three different situations end up here, and the per-namespace '
                       'banner below says which one applies. <b>The namespace is gone:</b> '
                       '<code>repo_checker -o connect</code> only accepts '
                       '<code>-a &lt;namespace&gt; -p &lt;profile&gt;</code> and resolves the repository by looking that '
