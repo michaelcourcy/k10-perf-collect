@@ -423,6 +423,65 @@ def ksm_pod_labels_exposed(prom, k10ns):
     return any(k.startswith("label_") for r in res for k in (r.get("metric") or {}))
 
 
+# Window for the report's headline figures (slowest/heaviest exports, K10 namespace usage).
+HIGHLIGHT_WINDOW_DAYS = 14
+
+
+def k10_namespace_usage(prom, k10ns, days=HIGHLIGHT_WINDOW_DAYS):
+    """CPU and memory of the whole K10 namespace over the last `days` (capped by the
+    Prometheus retention): requests against usage, the two lines of the OpenShift console
+    graph `sum(kube_pod_resource_request{namespace="kasten-io"})`.
+
+    Requests come from kube-state-metrics joined on Pending/Running pods, so they work on
+    any Prometheus; on OpenShift that matched kube_pod_resource_request exactly (only the
+    scheduler leader exports it, so it is not multiplied by the replica count). Each
+    point is the max over its step of a 1 m subquery: a datamover burst is minutes long
+    and a plain 20 min step would step over it."""
+    if not (prom and prom.available):
+        return None
+    end = time.time()
+    span = days * 86400
+    if prom.retention_seconds:
+        span = min(span, prom.retention_seconds)
+    start = end - span
+    step = max(60, int(span / 1000) // 60 * 60)
+    sel = 'namespace="%s",container!="",container!="POD"' % k10ns
+    running = ('max by (namespace,pod) (kube_pod_status_phase{namespace="%s",phase=~"Pending|Running"} == 1)'
+               % k10ns)
+    req = ('sum(kube_pod_container_resource_requests{namespace="%s",resource="%%s"} '
+           '* on(namespace,pod) group_left() %s)' % (k10ns, running))
+    queries = {
+        "cpu": {"usage": "sum(rate(container_cpu_usage_seconds_total{%s}[5m]))" % sel,
+                "requests": req % "cpu"},
+        "memory": {"usage": "sum(container_memory_working_set_bytes{%s})" % sel,
+                   "requests": req % "memory"},
+    }
+    out = {"windowStart": iso(dt.datetime.fromtimestamp(start, dt.timezone.utc)),
+           "windowEnd": iso(dt.datetime.fromtimestamp(end, dt.timezone.utc)),
+           "windowDays": round(span / 86400, 1), "stepSeconds": step,
+           "aggregation": "max over each step of a 1m subquery",
+           "queries": queries}
+    for res, qs in queries.items():
+        r_out = {}
+        for kind, q in qs.items():
+            try:
+                rows = prom.query_range("max_over_time((%s)[%ds:1m])" % (q, step), start, end, step=f"{step}s")
+            except Exception as ex:  # noqa: BLE001
+                r_out[kind] = {"error": str(ex)}
+                continue
+            vals = [(int(float(t)), float(v)) for t, v in (rows[0]["values"] if rows else [])]
+            peak = max(vals, key=lambda x: x[1]) if vals else None
+            r_out[kind] = {
+                "peak": peak[1] if peak else None,
+                "peakAt": iso(dt.datetime.fromtimestamp(peak[0], dt.timezone.utc)) if peak else None,
+                "mean": sum(v for _, v in vals) / len(vals) if vals else None,
+                "last": vals[-1][1] if vals else None,
+                "points": [[t, round(v, 4)] for t, v in vals],
+            }
+        out[res] = r_out
+    return out
+
+
 def datamover_metrics(prom, k10ns, pod_regex, start, end, namespace=None):
     """Datamover memory peak (of the sum) and CPU-seconds in [start, end], per-pod figures
     attributed to a namespace through kube_pod_labels (guide 09).
@@ -2646,6 +2705,11 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
             })
 
     pod_labels_exposed = ksm_pod_labels_exposed(prom, kube.k10ns) if (prom and prom.available) else None
+    k10_usage = None
+    if prom and prom.available:
+        with Step(f"{kube.k10ns} CPU/memory, last {HIGHLIGHT_WINDOW_DAYS} d", indent=2) as stp:
+            k10_usage = k10_namespace_usage(prom, kube.k10ns)
+            stp.note = f"{k10_usage['windowDays']} d at {k10_usage['stepSeconds']} s"
     topo = {
         "generatedAt": iso(dt.datetime.now(dt.timezone.utc)),
         "cluster": {"context": ctx, "uid": uid, "k10Version": ver, "k10Namespace": kube.k10ns},
@@ -2663,6 +2727,7 @@ def _assemble(args, kube, ctx, ver, uid, limiters, features, policies, profiles,
                             "unknown: kube_pod_labels could not be queried"),
             "caveat": "pods living under one kubelet scrape interval (30s) leave no usable sample and are listed "
                       "in podsWithoutSamples; peak figures are a floor for short exports",
+            "k10NamespaceUsage": k10_usage,
         },
         "nodes": nodes_info,
         "helmLimiters": limiters,

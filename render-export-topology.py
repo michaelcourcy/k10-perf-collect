@@ -92,6 +92,7 @@ CSS = """
   --good: #0ca30c; --critical: #d03b3b; --warning: #fab219; --serious: #ec835a;
   --good-text: #006300;
   --series-1: #2a78d6;   /* categorical slot 1: the histogram is one series */
+  --series-2: #eb6834;   /* slot 2: requests on the K10 namespace charts */
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -101,6 +102,7 @@ CSS = """
     --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
     --good-text: #0ca30c;
     --series-1: #3987e5;
+    --series-2: #d95926;
   }
 }
 * { box-sizing: border-box; }
@@ -137,7 +139,8 @@ summary.row span.num { text-align: right; font-variant-numeric: tabular-nums; wh
 .hdr span.num { text-align: right; }
 .detail { padding: 12px 10px 18px 28px; background: var(--plane); border-bottom: 1px solid var(--grid); }
 .two { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; gap: 24px; align-items: start; }
-@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; align-items: start; }
+@media (max-width: 900px) { .two, .pair { grid-template-columns: 1fr; } }
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
 .status i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .status.good i { background: var(--good); } .status.bad i { background: var(--critical); }
@@ -155,6 +158,14 @@ figcaption { font-size: 12px; color: var(--ink-2); margin-bottom: 8px; }
 .tv summary { font-size: 12px; color: var(--ink-2); margin-top: 8px; }
 .warn-box { border-left: 3px solid var(--warning); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+.lg i { display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+.lc { position: relative; }
+.lc svg { width: 100%; height: auto; display: block; }
+.lc .ax { font-size: 10px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.lc .tip { position: absolute; top: 4px; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 6px; padding: 6px 9px; font-size: 12px; white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
 footer { color: var(--muted); font-size: 12px; margin-top: 40px; }
 """
 
@@ -166,29 +177,47 @@ def ns_anchor(ns):
     return "ns-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", key).strip("-").lower()
 
 
-def highlights_block(nss):
+HIGHLIGHT_WINDOW_DAYS = 14   # same window as the generator's k10NamespaceUsage
+
+
+def highlights_block(nss, generated_at=None):
     """The two questions a reader of a 60-namespace report actually arrives with: what took
     longest, and what ate the most memory. Both are per ExportAction, and each row links to
-    the namespace card it belongs to - otherwise finding it means scrolling past everything."""
-    rows = []
+    the namespace card it belongs to - otherwise finding it means scrolling past everything.
+
+    Only exports started in the last HIGHLIGHT_WINDOW_DAYS before generation count, and a
+    namespace appears once per table (its worst export): an hourly policy otherwise filled
+    all five rows with the same namespace."""
+    end = ts_seconds(generated_at)
+    lo = end - HIGHLIGHT_WINDOW_DAYS * 86400 if end else None
+    rows, older = [], 0
     for n in nss:
         for e in n.get("exports") or []:
+            st = ts_seconds(e.get("startTime"))
+            if lo is not None and (st is None or st < lo):
+                older += 1
+                continue
             dm = e.get("datamover") or {}
             rows.append({"ns": n.get("name"), "anchor": ns_anchor(n),
                          "profile": (n.get("repository") or {}).get("profile"),
                          "start": e.get("startTime"), "dur": e.get("durationSeconds"),
                          "mem": dm.get("peakSumMemoryBytes"), "state": e.get("state"),
                          "pvcs": len((e.get("source") or {}).get("pvcs") or [])})
-    if not rows:
+    if not rows and not older:
         return ""
 
     def tbl(key, label, fmt):
-        top = [r for r in rows if r.get(key) is not None]
-        top.sort(key=lambda r: r[key], reverse=True)
-        top = top[:5]
+        best = {}
+        for r in rows:
+            if r.get(key) is None:
+                continue
+            if r["ns"] not in best or r[key] > best[r["ns"]][key]:
+                best[r["ns"]] = r
+        top = sorted(best.values(), key=lambda r: r[key], reverse=True)[:5]
         if not top:
             return (f'<div><figcaption>{esc(label)}</figcaption>'
-                    f'<div class="note">no {esc(label.lower())} available</div></div>')
+                    f'<div class="note">no {esc(label.lower())} available in the last '
+                    f'{HIGHLIGHT_WINDOW_DAYS} days</div></div>')
         return (f'<div><figcaption>{esc(label)}</figcaption>'
                 + table(["Namespace", "Export start", label.split(" ")[-1].capitalize(), "PVCs"],
                         [[f'<a href="#{esc(r["anchor"])}">{esc(r["ns"])}</a>',
@@ -197,17 +226,124 @@ def highlights_block(nss):
                 + '</div>')
 
     return ('<details class="card" open><summary><b>Where to look first</b> '
-            f'<span class="sub">the 5 slowest and the 5 heaviest ExportActions of '
-            f'{len(rows)} — click a namespace to jump to it</span></summary>'
-            '<div class="two">'
+            f'<span class="sub">the 5 slowest and the 5 heaviest namespaces over the last '
+            f'{HIGHLIGHT_WINDOW_DAYS} days, by their worst ExportAction ({len(rows)} exports'
+            + (f'; {older} older ones left out' if older else '')
+            + ') — click a namespace to jump to it</span></summary>'
+            '<div class="pair">'
             + tbl("dur", "Longest exports by duration", lambda v: esc(fmt_dur(v)))
             + tbl("mem", "Heaviest exports by peak memory", lambda v: esc(fmt_bytes(v)))
             + '</div>'
-            '<div class="note">Duration is the ExportAction\'s own start to end. Peak memory is the '
+            '<div class="note">One row per namespace: its longest, or its heaviest, export of the window. '
+            'Duration is the ExportAction\'s own start to end. Peak memory is the '
             'peak of the sum over every datamover pod alive in that export\'s window, so it includes '
             'concurrent exports of other namespaces - the per-export cell on the namespace card '
             'breaks that down. An export with no datamover samples cannot be ranked by memory and '
             'is left out of the right-hand table.</div></details>')
+
+
+def _line_chart(res, data, fmt_js):
+    """One resource (cpu or memory): usage and requests over the window, one y-axis.
+    Hover gives a crosshair with both values; the table view below carries the numbers."""
+    W, H, L, R, T, B = 560, 170, 56, 10, 8, 22
+    series = [("usage", "Usage", "var(--series-1)"), ("requests", "Requests", "var(--series-2)")]
+    pts = {k: (data.get(k) or {}).get("points") or [] for k, _, _ in series}
+    allp = [p for v in pts.values() for p in v]
+    if not allp:
+        return '<div class="note">no samples</div>'
+    t0, t1 = min(p[0] for p in allp), max(p[0] for p in allp)
+    ymax = max(p[1] for p in allp) * 1.1 or 1
+    x = lambda t: L + (t - t0) / ((t1 - t0) or 1) * (W - L - R)
+    y = lambda v: T + (1 - v / ymax) * (H - T - B)
+    grid = ""
+    for i in range(4):
+        v = ymax * i / 3
+        grid += (f'<line x1="{L}" x2="{W - R}" y1="{y(v):.1f}" y2="{y(v):.1f}" stroke="var(--grid)"/>'
+                 f'<text x="{L - 6}" y="{y(v) + 4:.1f}" text-anchor="end" class="ax" data-v="{v}"></text>')
+    day = 86400
+    d = (int(t0) // day + 1) * day
+    stride = max(1, int((t1 - t0) / day / 7))
+    k = 0
+    while d < t1:
+        if k % stride == 0:
+            grid += (f'<line x1="{x(d):.1f}" x2="{x(d):.1f}" y1="{H - B}" y2="{H - B + 4}" stroke="var(--axis)"/>'
+                     f'<text x="{x(d):.1f}" y="{H - 6}" text-anchor="middle" class="ax">'
+                     f'{dt.datetime.fromtimestamp(d, dt.timezone.utc).strftime("%m-%d")}</text>')
+        d += day
+        k += 1
+    lines = "".join(
+        f'<polyline fill="none" stroke="{c}" stroke-width="2" stroke-linejoin="round" '
+        f'points="{" ".join(f"{x(t):.1f},{y(v):.1f}" for t, v in pts[k_])}"/>'
+        for k_, _, c in series if pts[k_])
+    payload = {"t0": t0, "t1": t1, "L": L, "R": R, "W": W, "T": T, "B": B, "H": H, "ymax": ymax,
+               "fmt": fmt_js, "s": [{"n": n, "p": pts[k_]} for k_, n, _ in series]}
+    legend = "".join(f'<span class="lg"><i style="background:{c}"></i>{esc(n)}</span>' for _, n, c in series)
+    return (f'<div class="legend">{legend}</div>'
+            f'<div class="lc" data-chart="{esc(json.dumps(payload, separators=(",", ":")))}">'
+            f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{esc(res)} usage and requests">'
+            f'{grid}<line x1="{L}" x2="{W - R}" y1="{H - B}" y2="{H - B}" stroke="var(--axis)"/>{lines}'
+            f'<line class="xh" y1="{T}" y2="{H - B}" stroke="var(--ink-2)" stroke-width="1" visibility="hidden"/>'
+            f'<rect x="{L}" y="{T}" width="{W - L - R}" height="{H - T - B}" fill="transparent"/></svg>'
+            '<div class="tip" hidden></div></div>')
+
+
+CHART_JS = r"""
+(function(){
+  function f(v,k){ if(v==null) return "–";
+    if(k==="bytes"){ var u=["B","KiB","MiB","GiB","TiB"],i=0; while(Math.abs(v)>=1024&&i<4){v/=1024;i++;} return v.toFixed(i?1:0)+" "+u[i]; }
+    return v.toFixed(v<10?2:1)+" cores"; }
+  document.querySelectorAll(".lc").forEach(function(el){
+    var d=JSON.parse(el.dataset.chart), svg=el.querySelector("svg"), xh=svg.querySelector(".xh"), tip=el.querySelector(".tip");
+    svg.querySelectorAll("text[data-v]").forEach(function(t){ t.textContent=f(+t.dataset.v,d.fmt).replace(" cores",""); });
+    svg.addEventListener("mousemove",function(ev){
+      var r=svg.getBoundingClientRect(), sx=(ev.clientX-r.left)*d.W/r.width;
+      var t=d.t0+(sx-d.L)/(d.W-d.L-d.R)*(d.t1-d.t0); if(sx<d.L||sx>d.W-d.R){ tip.hidden=true; xh.setAttribute("visibility","hidden"); return; }
+      var rows=d.s.map(function(s){ var best=null; s.p.forEach(function(p){ if(!best||Math.abs(p[0]-t)<Math.abs(best[0]-t)) best=p; }); return [s.n,best]; });
+      var at=rows[0][1]||rows[1][1], px=d.L+(at[0]-d.t0)/(d.t1-d.t0)*(d.W-d.L-d.R);
+      xh.setAttribute("x1",px); xh.setAttribute("x2",px); xh.setAttribute("visibility","visible");
+      tip.innerHTML="<b>"+new Date(at[0]*1000).toISOString().slice(0,16).replace("T"," ")+"Z</b>"+rows.map(function(x){return "<div>"+x[0]+" <b>"+f(x[1]&&x[1][1],d.fmt)+"</b></div>";}).join("");
+      tip.hidden=false; var left=px/d.W*r.width; tip.style.left=(left>r.width/2? left-tip.offsetWidth-10 : left+10)+"px";
+    });
+    svg.addEventListener("mouseleave",function(){ tip.hidden=true; xh.setAttribute("visibility","hidden"); });
+  });
+})();
+"""
+
+
+def k10_usage_block(met, k10ns):
+    """CPU and memory of the K10 namespace over the highlight window, requests against
+    usage - the OpenShift console graph a customer already looks at, next to the exports
+    that caused the peaks."""
+    u = (met or {}).get("k10NamespaceUsage")
+    if not u:
+        why = ("cluster monitoring (cAdvisor) was not available for this run" if met and not met.get("available")
+               else "metrics were not collected (--no-metrics)" if not met else
+               "this JSON predates the K10 namespace usage collection")
+        return (f'<div class="card"><b>{esc(k10ns)} CPU and memory</b> '
+                f'<span class="sub">not shown: {esc(why)}</span></div>')
+    figs, trows = "", []
+    for res, label, fmt, fmt_js in (("cpu", "CPU (cores)", lambda v: "–" if v is None else f"{v:,.2f} cores", "cores"),
+                                    ("memory", "Memory", fmt_bytes, "bytes")):
+        data = u.get(res) or {}
+        figs += f'<figure><figcaption>{esc(label)}</figcaption>{_line_chart(res, data, fmt_js)}</figure>'
+        for kind, kl in (("usage", "usage"), ("requests", "requests")):
+            s = data.get(kind) or {}
+            trows.append([esc(f"{label.split(' ')[0]} {kl}"),
+                          (f'<span class="muted">{esc(s["error"][:120])}</span>' if s.get("error") else esc(fmt(s.get("peak")))),
+                          esc(fmt_ts(s.get("peakAt"))), esc(fmt(s.get("mean"))), esc(fmt(s.get("last")))])
+    return ('<details class="card" open><summary><b>' + esc(k10ns) + ' CPU and memory</b> '
+            f'<span class="sub">requests against usage, {esc(u.get("windowDays"))} days to '
+            f'{esc(fmt_ts(u.get("windowEnd")))}, one point per {fmt_dur(u.get("stepSeconds"))} (the max within it)'
+            '</span></summary>'
+            f'<div class="pair">{figs}</div>'
+            '<details class="tv"><summary>Table view</summary>'
+            + table(["Series", "Peak", "Peak at", "Mean", "Last"], trows, num_cols=(1, 3, 4))
+            + '</details>'
+            '<div class="note">Requests are what the scheduler reserves on the nodes for the namespace\'s '
+            'running pods, used or not. Usage above requests is expected: datamover pods ship with '
+            '<code>resources: {}</code> (BestEffort), so a burst of exports consumes capacity that '
+            'nothing reserved. Usage is cAdvisor (working set, CPU rate over 5 min); requests are '
+            'kube-state-metrics on Pending/Running pods.</div></details>')
 
 
 def tile(label, value, note=None):
@@ -1033,7 +1169,8 @@ def render(t, banner=None):
         + f'<div class="kpis">{"".join(kpis)}</div>'
         f'<div class="note">Only namespaces with volume data in a Kopia repository appear. Datamover CPU/memory is the sum over '
         f'all datamover pods alive in each window — attributed to namespace and job via kube-state-metrics pod labels, not to a PVC.</div>'
-        + highlights_block(nss)
+        + highlights_block(nss, t.get("generatedAt"))
+        + k10_usage_block(met, cl.get("k10Namespace") or "kasten-io")
         + f'{warn_html}{nodes_block(t.get("nodes"))}{limiters_block(t.get("helmLimiters"))}'
         + "".join(policy_card(p) for p in pols)
         + extra_html
@@ -1042,7 +1179,7 @@ def render(t, banner=None):
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>K10 export topology — {esc(cl.get("context"))}</title><style>{CSS}</style></head>'
-            f'<body><main>{body}</main></body></html>')
+            f'<body><main>{body}</main><script>{CHART_JS}</script></body></html>')
 
 
 def main():
